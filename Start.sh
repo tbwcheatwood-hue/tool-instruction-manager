@@ -48,10 +48,26 @@ pick_node() {
 port_open() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn | grep -q ":${port} "
-    return
+    ss -ltn | grep -q ":${port} " || return 1
+    return 0
   fi
   (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
+}
+
+page_ok() {
+  "$NODE" -e "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1
+}
+
+open_browser() {
+  local url="http://127.0.0.1:5173/"
+  if command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 && return 0
+  fi
+  if command -v gio >/dev/null 2>&1; then
+    gio open "$url" >/dev/null 2>&1 && return 0
+  fi
+  echo "Open ${url} in a browser."
+  return 1
 }
 
 NODE="$(pick_node)" || die "Node.js 20 or newer is required. The node command on PATH is too old or missing. Install Node 20+ and run this script again. On this machine, Node 22 may already be at ~/.local/node if that directory exists."
@@ -127,11 +143,13 @@ start_studio() {
 start_studio
 
 if port_open 5173 || port_open 8787; then
-  echo "Agent Routing Lab already appears to be running."
-  echo "Open http://127.0.0.1:5173/ in a browser."
-  echo "Stop the existing terminal with Ctrl+C before starting another copy."
-  if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "http://127.0.0.1:5173/" >/dev/null 2>&1 || true
+  if page_ok; then
+    echo "Agent Routing Lab is already running at http://127.0.0.1:5173/"
+    open_browser || true
+  else
+    echo "Port 5173 or 8787 is in use, but the lab page is not responding."
+    echo "Close the old terminal, or stop the program using that port, then run ./Start.sh again."
+    exit 1
   fi
   # This short run must not stop a studio it did not start in a previous terminal.
   if [[ -n "${STUDIO_PID}" ]]; then
@@ -146,17 +164,16 @@ echo "Interface: http://127.0.0.1:5173/"
 echo "API:       http://127.0.0.1:8787/"
 echo "Press Ctrl+C in this terminal to stop both servers."
 
-if command -v xdg-open >/dev/null 2>&1; then
-  (
-    for _ in $(seq 1 40); do
-      if port_open 5173; then
-        xdg-open "http://127.0.0.1:5173/" >/dev/null 2>&1 || true
-        exit 0
-      fi
-      sleep 0.5
-    done
-  ) &
-fi
+(
+  for _ in $(seq 1 60); do
+    if page_ok; then
+      open_browser || true
+      exit 0
+    fi
+    sleep 0.5
+  done
+  echo "The lab did not answer at http://127.0.0.1:5173/. See the messages above."
+) &
 
 set +e
 npm run dev
