@@ -1,0 +1,13 @@
+# Keep launcher line endings right whatever core.autocrlf says:
+# bash refuses CRLF scripts, cmd mis-parses labels in LF batch files.
+*.sh   text eol=lf
+*.bat  text eol=crlf
+*.ps1  text eol=crlf
+
+# Git hooks have no extension, and bash refuses a CRLF script: a converted hook
+# fails with "bad interpreter" and every commit is refused for the wrong reason.
+.githooks/*  text eol=lf
+
+# Vendored / binary
+ui/vendor/** -diff
+tools/cacert.pem -diff

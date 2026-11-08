@@ -21,6 +21,13 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 
 export type RunSummary = Pick<RunResult, "id" | "workflowId" | "workflowName" | "status" | "startedAt" | "finishedAt">;
 
+export interface StudioStatus {
+  name: string;
+  url: string;
+  running: boolean;
+  hasToken: boolean;
+}
+
 export const api = {
   examples: () => request<Workflow[]>("/api/examples"),
   workflows: () => request<Workflow[]>("/api/workflows"),
@@ -35,6 +42,13 @@ export const api = {
   updateProvider: (id: string, body: { name: string; baseUrl: string; model: string; apiKey?: string | null }) =>
     request<ProviderPublic>(`/api/providers/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   testProvider: (id: string) => request<{ ok: boolean; simulated: boolean; message?: string; text?: string; error?: string }>(`/api/providers/${id}/test`, { method: "POST", body: "{}" }),
+  studio: () => request<StudioStatus>("/api/studio"),
+  saveStudio: (body: { url: string; token?: string | null }) => request<StudioStatus>("/api/studio", { method: "PUT", body: JSON.stringify(body) }),
+  chat: (providerId: string, messages: { role: "system" | "user" | "assistant"; content: string }[]) =>
+    request<{ text: string; simulated: boolean; providerId: string; model: string; connection: "simulated" | "local" | "external" }>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ providerId, messages }),
+    }),
   startRun: (workflow: Workflow, input: unknown) => request<{ runId: string }>("/api/runs", { method: "POST", body: JSON.stringify({ workflow, input }) }),
   run: (id: string) => request<RunResult>(`/api/runs/${id}`),
   runs: () => request<RunSummary[]>("/api/runs"),

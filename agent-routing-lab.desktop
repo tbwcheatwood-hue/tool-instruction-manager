@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Agent Routing Lab
+Comment=Start the local Agent Routing Lab
+Exec="/home/livingroom/agent-routing-lab/Start.sh"
+Path=/home/livingroom/agent-routing-lab
+Terminal=true
+Categories=Development;
+StartupNotify=true

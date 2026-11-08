@@ -88,6 +88,42 @@ describe("HTTP API", () => {
     expect(finished.status).toBe("rejected");
   });
 
+  it("keeps the studio on this machine and does not return its token", async () => {
+    const base = await start();
+    const rejected = await fetch(`${base}/api/studio`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "https://example.com", token: "studio-secret" }),
+    });
+    expect(rejected.status).toBe(400);
+
+    const saved = await fetch(`${base}/api/studio`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ url: "http://127.0.0.1:8080/path", token: "studio-secret" }),
+    });
+    expect(saved.status).toBe(200);
+    const body = (await saved.json()) as { url: string; hasToken: boolean; token?: string };
+    expect(body.url).toBe("http://127.0.0.1:8080/");
+    expect(body.hasToken).toBe(true);
+    expect(JSON.stringify(body)).not.toContain("studio-secret");
+  });
+
+  it("answers chat from the simulated provider", async () => {
+    const base = await start();
+    const response = await fetch(`${base}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ providerId: "simulated", messages: [{ role: "user", content: "hello lab" }] }),
+    });
+    const body = (await response.json()) as { simulated: boolean; connection: string; text: string };
+    expect(response.status).toBe(200);
+    expect(body.simulated).toBe(true);
+    expect(body.connection).toBe("simulated");
+    expect(body.text).toContain("[simulated]");
+    expect(body.text).toContain("hello lab");
+  });
+
   it("reports the simulated provider test without calling a model", async () => {
     const base = await start();
     const response = await fetch(`${base}/api/providers/simulated/test`, { method: "POST" });

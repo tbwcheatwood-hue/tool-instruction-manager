@@ -36,6 +36,16 @@ The reviewer reads artifacts produced by its ancestor nodes, not artifacts writt
 
 `POST /api/runs` starts a run and returns immediately. `GET /api/runs/:id/stream` replays events as server-sent events. The finished run is stored in `data/runs`. The UI also polls the run so the final status does not depend on the stream staying open.
 
+## Workspace
+
+The client is one window with three views: the canvas, a chat panel, and an embedded Autonomous Loop Studio frame. Chat and the canvas share `data/providers.json`. The Active pill is `connectionKind` from `src/shared/connection.ts`: simulated, loopback (local model), or any other host (external).
+
+`POST /api/chat` calls the selected provider from the lab server. A simulated provider never calls `fetch`. A real provider uses the same OpenAI-compatible client as an agent node.
+
+`studio_relay` is a tool handled in the engine through an injected callback. The server callback posts the upstream text to the PHP app's `POST /api/llm` on the saved loopback origin, with `X-Router-Token` when a token is stored. Simulated providers skip that call. The studio URL is rejected unless the host is `127.0.0.1`, `localhost`, or `::1`. The token is stored in `data/studio.json` and is not included in API responses.
+
+The PHP app remains the program in `autonomous/`. Its shell, files, MCP, and autonomous loops are used inside that app, which keeps its own token and approval checks. The lab does not reimplement them.
+
 ## Smallest useful slice
 
 The first version ships the engine, the six node kinds, both provider kinds, file persistence, import/export, and the canvas. It does not stream model tokens, run cycles, call third-party tools, or use a model as the reviewer.

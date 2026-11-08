@@ -184,6 +184,29 @@ describe("workflow execution", () => {
     await expect(executeWorkflow(workflow, { input: "x", providers: [simulated] })).rejects.toBeInstanceOf(WorkflowError);
   });
 
+  it("routes studio_relay through the injected hook without copying a provider key", async () => {
+    const workflow = chain(
+      [
+        { id: "in", kind: "input", position: { x: 0, y: 0 }, label: "In", config: {} },
+        { id: "relay", kind: "tool", position: { x: 80, y: 0 }, label: "Relay", config: { tool: "studio_relay", providerId: "local" } },
+      ],
+      [{ id: "e", source: "in", target: "relay" }],
+    );
+    let prompt = "";
+    const result = await executeWorkflow(workflow, {
+      input: "hello studio",
+      providers: [simulated, live],
+      studioRelay: async (request) => {
+        prompt = request.prompt;
+        return { text: "from studio", via: "studio" };
+      },
+    });
+    expect(prompt).toContain("hello studio");
+    expect(result.status).toBe("ok");
+    expect(result.nodeResults.relay?.output).toMatchObject({ via: "studio", text: "from studio" });
+    expect(JSON.stringify(result)).not.toContain("sk-test-secret");
+  });
+
   it("round-trips workflow JSON", () => {
     const parsed = parseWorkflow(JSON.parse(JSON.stringify(reviewPassWorkflow())));
     expect(parsed.nodes).toHaveLength(5);

@@ -5,10 +5,17 @@ import { reviewClaim } from "./reviewer";
 import { asText, asStringList, lookup, textOfOutput } from "./text";
 import { runTool, type ToolInput } from "./tools";
 
+export interface StudioRelayRequest {
+  providerId: string;
+  prompt: string;
+  temperature: number;
+}
+
 export interface ExecuteOptions {
   input: unknown;
   providers: ProviderConfig[];
   fetchImpl?: FetchLike;
+  studioRelay?: (request: StudioRelayRequest) => Promise<{ text: string; via: "simulated" | "studio" }>;
   events?: RunEvent[];
   onEvent?: (event: RunEvent) => void;
   trace?: string[];
@@ -157,6 +164,19 @@ export async function executeWorkflow(workflow: Workflow, options: ExecuteOption
       if (node.kind === "tool") {
         const toolName = String(node.config.tool ?? "echo");
         push({ nodeId: node.id, kind: "tool_call", status: "running", payload: { tool: toolName, input: merged.text } });
+        if (toolName === "studio_relay") {
+          if (!options.studioRelay) throw new Error("Studio relay is not configured on this server");
+          const providerId = String(node.config.providerId ?? "simulated");
+          const relayed = await options.studioRelay({
+            providerId,
+            prompt: merged.text,
+            temperature: Number(node.config.temperature ?? 0.2),
+          });
+          const output = { text: relayed.text, tool: "studio_relay", via: relayed.via, providerId };
+          activate(node);
+          finish(node, "ok", output);
+          return;
+        }
         const toolInputs: ToolInput[] = inputs;
         const ran = await runTool({ node, inputs: toolInputs, artifacts });
         for (const artifact of ran.artifactsWritten) {

@@ -72,6 +72,7 @@ export function Inspector({
           <label className="field">
             <span>Tool</span>
             <select value={String(config.tool ?? "echo")} onChange={(event) => setConfig("tool", event.target.value)}>
+              <option value="studio_relay">studio_relay</option>
               <option value="write_artifact">write_artifact</option>
               <option value="template">template</option>
               <option value="concat">concat</option>
@@ -85,6 +86,21 @@ export function Inspector({
           <Field label="JSON path" value={String(config.path ?? "")} onChange={(value) => setConfig("path", value)} />
           <Field label="Separator" value={String(config.separator ?? "\n")} onChange={(value) => setConfig("separator", value)} />
           <Field label="Delay ms" value={String(config.delayMs ?? 40)} onChange={(value) => setConfig("delayMs", Number(value))} />
+          {String(config.tool) === "studio_relay" && (
+            <>
+              <label className="field">
+                <span>Provider</span>
+                <select value={String(config.providerId ?? "simulated")} onChange={(event) => setConfig("providerId", event.target.value)}>
+                  {providers.map((provider) => (
+                    <option key={provider.id} value={provider.id}>
+                      {provider.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <p className="hint">Sends the upstream text through the PHP studio relay. A simulated provider does not call the studio. The studio address and token stay on this machine.</p>
+            </>
+          )}
         </>
       )}
       {node.data.kind === "branch" && (

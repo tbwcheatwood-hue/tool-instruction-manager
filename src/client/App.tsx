@@ -13,12 +13,15 @@ import {
   type Edge,
   type Node,
 } from "@xyflow/react";
+import { connectionKind, connectionLabel } from "../shared/connection";
 import type { Artifact, NodeKind, ProviderPublic, RunEvent, RunStatus, Workflow } from "../shared/types";
 import { api, watchRun, type RunSummary } from "./api";
+import { Chat } from "./Chat";
 import { createFlowNode, toFlow, toWorkflow, type NodeData } from "./flow";
 import { Inspector } from "./Inspector";
 import { Monitor } from "./Monitor";
 import { nodeTypes } from "./nodes";
+import { StudioPanel } from "./StudioPanel";
 
 const PALETTE: { kind: NodeKind; blurb: string }[] = [
   { kind: "input", blurb: "Run payload" },
@@ -44,6 +47,8 @@ function Studio() {
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [running, setRunning] = useState(false);
+  const [view, setView] = useState<"workflow" | "chat" | "studio">("workflow");
+  const [activeProviderId, setActiveProviderId] = useState("simulated");
   const [providerForm, setProviderForm] = useState({ name: "Local endpoint", baseUrl: "http://127.0.0.1:11434/v1", model: "", apiKey: "" });
   const { screenToFlowPosition } = useReactFlow();
 
@@ -219,75 +224,112 @@ function Studio() {
     }
   };
 
+  const activeProvider = providers.find((provider) => provider.id === activeProviderId) ?? providers[0];
+
   return (
-    <div className="app">
+    <div className={`app view-${view}`}>
       <header className="topbar">
         <div className="brand">
           <span className="mark" aria-hidden="true">AR</span>
           <div>
             <h1>Agent Routing Lab</h1>
-            <p>Route work across agents, tools, and reviews</p>
+            <p>Workflow, chat, and Loop Studio</p>
           </div>
         </div>
-        <div className="workflow-group">
-          <label>
+        <nav className="view-switch" aria-label="Workspace">
+          <button type="button" className={view === "workflow" ? "primary" : "ghost"} aria-pressed={view === "workflow"} onClick={() => setView("workflow")}>
             Workflow
-            <input aria-label="Workflow name" value={name} onChange={(event) => setName(event.target.value)} />
-          </label>
-          <label>
-            Open
-            <select
-              aria-label="Saved workflows"
-              value={workflowId}
-              onChange={(event) => {
-                const workflow = saved.find((item) => item.id === event.target.value);
-                if (workflow) applyWorkflow(workflow);
-              }}
-            >
-              {!saved.some((item) => item.id === workflowId) && <option value={workflowId}>Unsaved canvas</option>}
-              {saved.map((workflow) => (
-                <option key={workflow.id} value={workflow.id}>
-                  {workflow.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="action-group">
-          <button type="button" className="primary" onClick={() => void save()}>
-            Save
           </button>
-          <button type="button" className="ghost" onClick={exportWorkflow}>
-            Export
+          <button type="button" className={view === "chat" ? "primary" : "ghost"} aria-pressed={view === "chat"} onClick={() => setView("chat")}>
+            Chat
           </button>
-          <label className="ghost file">
-            Import
-            <input
-              aria-label="Import workflow JSON"
-              type="file"
-              accept="application/json"
-              hidden
-              onChange={(event) => {
-                const file = event.target.files?.[0];
-                if (file) void importWorkflow(file);
-                event.target.value = "";
-              }}
-            />
-          </label>
-        </div>
-        <div className="example-group" aria-label="Examples">
-          <span>Examples</span>
-          <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[0]))}>
-            Pass
+          <button type="button" className={view === "studio" ? "primary" : "ghost"} aria-pressed={view === "studio"} onClick={() => setView("studio")}>
+            Loop Studio
           </button>
-          <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[1]))}>
-            Reject
-          </button>
-          <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[2]))}>
-            Branch
-          </button>
-        </div>
+        </nav>
+        {activeProvider && <span className={`pill connection-${connectionKind(activeProvider)}`}>Active: {connectionLabel(activeProvider)}</span>}
+        {view === "workflow" && (
+          <>
+            <div className="workflow-group">
+              <label>
+                Workflow
+                <input aria-label="Workflow name" value={name} onChange={(event) => setName(event.target.value)} />
+              </label>
+              <label>
+                Open
+                <select
+                  aria-label="Saved workflows"
+                  value={workflowId}
+                  onChange={(event) => {
+                    const workflow = saved.find((item) => item.id === event.target.value);
+                    if (workflow) applyWorkflow(workflow);
+                  }}
+                >
+                  {!saved.some((item) => item.id === workflowId) && <option value={workflowId}>Unsaved canvas</option>}
+                  {saved.map((workflow) => (
+                    <option key={workflow.id} value={workflow.id}>
+                      {workflow.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="action-group">
+              <button type="button" className="primary" onClick={() => void save()}>
+                Save
+              </button>
+              <button type="button" className="ghost" onClick={exportWorkflow}>
+                Export
+              </button>
+              <label className="ghost file">
+                Import
+                <input
+                  aria-label="Import workflow JSON"
+                  type="file"
+                  accept="application/json"
+                  hidden
+                  onChange={(event) => {
+                    const file = event.target.files?.[0];
+                    if (file) void importWorkflow(file);
+                    event.target.value = "";
+                  }}
+                />
+              </label>
+            </div>
+            <div className="example-group" aria-label="Examples">
+              <span>Examples</span>
+              <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[0]))}>
+                Pass
+              </button>
+              <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[1]))}>
+                Reject
+              </button>
+              <button type="button" className="ghost" onClick={() => void api.examples().then((items) => applyWorkflow(items[2]))}>
+                Branch
+              </button>
+            </div>
+          </>
+        )}
       </header>
+      {view === "chat" && (
+        <Chat
+          providers={providers}
+          activeId={activeProvider?.id ?? "simulated"}
+          onActive={setActiveProviderId}
+          onCreate={async (form) => {
+            const created = await api.createProvider(form);
+            setProviders(await api.providers());
+            setActiveProviderId(created.id);
+          }}
+          onTest={async (id) => {
+            await testProvider(id);
+            setActiveProviderId(id);
+          }}
+        />
+      )}
+      {view === "studio" && <StudioPanel />}
+      {view === "workflow" && (
+      <>
       <div className="body">
         <aside className="palette">
           <section>
@@ -314,11 +356,11 @@ function Studio() {
             <p className="hint">Simulated stays on this machine. An OpenAI-compatible endpoint uses the base URL you save.</p>
             <div className="provider-list">
               {providers.map((provider) => (
-                <article key={provider.id} className="provider-card">
-                  <div>
+                <article key={provider.id} className={`provider-card ${provider.id === activeProvider?.id ? "is-active" : ""}`}>
+                  <button type="button" className="ghost provider-pick" onClick={() => setActiveProviderId(provider.id)}>
                     <strong>{provider.name}</strong>
-                    <div className="muted">{provider.kind === "simulated" ? "Simulated" : provider.baseUrl || "No base URL"}</div>
-                  </div>
+                    <span className={`connection connection-${connectionKind(provider)}`}>{connectionLabel(provider)}</span>
+                  </button>
                   <button type="button" className="ghost" onClick={() => void testProvider(provider.id)}>
                     Test
                   </button>
@@ -374,6 +416,8 @@ function Studio() {
         onRun={() => void run()}
         onSelectHistory={(id) => void showHistory(id)}
       />
+      </>
+      )}
     </div>
   );
 }

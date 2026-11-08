@@ -3,3 +3,18 @@ dist
 data
 *.log
 .DS_Store
+
+# Autonomous Loop Studio runtime data (keys, token, sessions).
+autonomous/storage/config.json
+autonomous/storage/state.json
+autonomous/storage/exec.log
+autonomous/storage/mcp.log
+autonomous/storage/exec-approvals.json
+autonomous/storage/sessions/*.json
+autonomous/storage/php-runtime.ini
+autonomous/storage/browser-profile/
+autonomous/storage/browser.json
+autonomous/storage/updates/
+autonomous/sandbox/*
+!autonomous/sandbox/.gitkeep
+autonomous/*.bak

@@ -3,7 +3,7 @@ import type { ProviderConfig } from "../shared/types";
 export type FetchLike = typeof fetch;
 
 export interface ChatMessage {
-  role: "system" | "user";
+  role: "system" | "user" | "assistant";
   content: string;
 }
 

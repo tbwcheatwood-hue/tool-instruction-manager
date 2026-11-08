@@ -5,7 +5,9 @@ import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { executeWorkflow } from "../engine/execute";
 import { examples } from "../engine/examples";
-import { callOpenAICompatible } from "../engine/providers";
+import { callOpenAICompatible, resolveProvider, type ChatMessage } from "../engine/providers";
+import { connectionKind } from "../shared/connection";
+import { assertLoopbackStudioUrl, probeStudio, readStudio, relayViaStudio, writeStudio } from "./studio";
 import type { ProviderConfig, ProviderPublic, RunEvent, RunResult, Workflow } from "../shared/types";
 import { WorkflowError, parseWorkflow } from "../shared/workflow";
 import { FileStore } from "./store";
@@ -46,6 +48,76 @@ export function createApp(dataDir: string): Express {
 
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true, service: "agent-routing-lab" });
+  });
+
+  const studioStatus = async () => {
+    const settings = await readStudio(dataDir);
+    return {
+      name: "Autonomous Loop Studio",
+      url: settings.url,
+      running: await probeStudio(settings.url),
+      hasToken: Boolean(settings.token),
+    };
+  };
+
+  app.get("/api/studio", (_req, res) => {
+    void gate(res, async () => {
+      res.json(await studioStatus());
+    });
+  });
+
+  app.put("/api/studio", (req, res) => {
+    void gate(res, async () => {
+      const current = await readStudio(dataDir);
+      let url: string;
+      try {
+        url = assertLoopbackStudioUrl(typeof req.body?.url === "string" ? req.body.url : current.url);
+      } catch (error) {
+        throw new WorkflowError(error instanceof Error ? error.message : String(error));
+      }
+      let token = current.token;
+      if (req.body?.token === null) token = "";
+      else if (typeof req.body?.token === "string" && req.body.token.trim()) token = req.body.token.trim();
+      await writeStudio(dataDir, { url, token });
+      res.json(await studioStatus());
+    });
+  });
+
+  app.post("/api/chat", (req, res) => {
+    void gate(res, async () => {
+      const provider = resolveProvider(await store.listProviders(), String(req.body?.providerId ?? ""));
+      const incoming = Array.isArray(req.body?.messages) ? req.body.messages : [];
+      if (incoming.length < 1 || incoming.length > 40) throw new WorkflowError("Send between 1 and 40 messages");
+      const messages: ChatMessage[] = incoming.map((message: unknown) => {
+        if (!message || typeof message !== "object") throw new WorkflowError("Each message needs a role and content");
+        const record = message as { role?: unknown; content?: unknown };
+        if (record.role !== "system" && record.role !== "user" && record.role !== "assistant") throw new WorkflowError("Message role is not supported");
+        if (typeof record.content !== "string" || !record.content.trim() || record.content.length > 20_000) {
+          throw new WorkflowError("Each message needs text under 20000 characters");
+        }
+        return { role: record.role, content: record.content };
+      });
+      const kind = connectionKind(provider);
+      if (provider.kind === "simulated") {
+        const latest = [...messages].reverse().find((message) => message.role === "user")?.content ?? "";
+        res.json({
+          text: `[simulated] No model endpoint was called.\n${latest}`,
+          simulated: true,
+          providerId: provider.id,
+          model: "simulated",
+          connection: kind,
+        });
+        return;
+      }
+      const result = await callOpenAICompatible({
+        provider,
+        model: provider.model ?? "",
+        temperature: 0.2,
+        messages,
+        fetchImpl: fetch,
+      });
+      res.json({ text: result.text, simulated: false, providerId: provider.id, model: provider.model ?? "", connection: kind });
+    });
   });
 
   app.get("/api/examples", (_req, res) => {
@@ -283,6 +355,11 @@ export function createApp(dataDir: string): Express {
             events: run.events,
             onEvent: (event) => {
               for (const listener of run.listeners) listener(event);
+            },
+            studioRelay: async (request) => {
+              const provider = resolveProvider(providers, request.providerId);
+              const settings = await readStudio(dataDir);
+              return relayViaStudio({ settings, provider, prompt: request.prompt, temperature: request.temperature });
             },
           });
           run.status = result.status;

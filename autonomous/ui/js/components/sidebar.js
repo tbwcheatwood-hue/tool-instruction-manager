@@ -1,0 +1,4766 @@
+/*
+ * Copyright M. Bryce Hudson 2026-2029 All Rights Reserved
+ *
+ * Unauthorized reproduction, distribution, or transmission of the work is prohibited without prior written permission, with exceptions for brief quotations and specific noncommercial uses under copyright law.
+ *
+ * BryceFromIndiana@gmail.com
+ */
+
+// ============================================
+// SIDEBAR.JS — Sidebar tabs controller
+// ============================================
+
+import { store } from '../store.js?v=409';
+import { K } from '../storage.js?v=409';
+import { persistence } from '../persistence.js?v=409';
+import { api } from '../api.js?v=409';
+import { esc, escAttr, timeAgo, agentCode, copyToClipboard, downloadFile, DEFAULT_HISTORY_TURNS } from '../utils.js?v=409';
+import { errText } from '../api.js?v=409';
+import { TOOL_REGISTRY, sandboxBindingReport, bindSandboxNow } from '../tools.js?v=409';
+import { refreshAgentClocks, initClocks } from '../agentClock.js?v=409';
+import { snapshot } from '../rateGovernor.js?v=409';
+import { resetBrowserEnabled } from '../toolManifest.js?v=409';
+import { perf } from '../perf.js?v=409';
+import { normalizeIface, IFACE_EVENT } from '../ifaceMode.js?v=409';
+import { BACKUP_SECTIONS, sanitizeBackupName, defaultBackupName, summarizeBackup, backupTokenDiffers } from '../backupSections.js?v=409';
+
+// Config section open/closed state. Session-only on purpose: a fresh load
+// always starts with every section collapsed, and the ones you open stay open
+// until you reload. It is a view preference, so it is never persisted and
+// never reaches the server or another device.
+
+export class Sidebar {
+  constructor() {
+    this.bodyEl = null;
+    this.activeTab = 'agents';
+    this.busySessionId = null;
+    this.workingAgents = new Set();
+    // Set by app.js. The Agents-tab header carries the API Lab and Brain Lab
+    // buttons; both screens are drawers this tab only has to point at.
+    this.apiLab = null;
+    this.brainLab = null;
+    // Config section ids currently expanded, for THIS session only. Starts
+    // empty so every section is collapsed on load; opening one keeps it open
+    // for the session and a reload resets them all to collapsed.
+    this._cfgOpen = new Set();
+    // A working directory the user typed but has not saved yet. The field is
+    // rebuilt on every render and refetched from the server, so without this
+    // the text vanished when they changed tabs.
+    this._cfgPendingDir = null;
+    // MCP servers this app CALLS (client), cached from the server; null = not fetched yet.
+    this._mcpServers = null;
+    // MCP *server* config (this app AS a server): tokens, scopes, root, protect.
+    this._mcpSrv = null;
+    // Plaintext of friend tokens THIS page had issued by a save, keyed by token
+    // id. The server never sends a stored token back (Config::maskSecrets), so
+    // this is the only place a value lives after it is created -- which is what
+    // "shown once" means in practice: reload, and it is gone.
+    this._mcpSrvFresh = {};
+    // Agents with a standing goal that are mid-tick right now, so the ALWAYS ON
+    // badge can show it and offer the stop control only when it would do
+    // something.
+    this._alwaysOnRunning = new Set();
+    // Agents the user has stopped by hand: their badge becomes the release.
+    this._alwaysOnHeld = new Set();
+  }
+
+  init() {
+    this.bodyEl = document.getElementById('sidebarBody');
+    // Token clocks repaint on usage + governor events; the module owns its
+    // listeners and its minute ticker from here.
+    try { initClocks(); } catch { /* clocks are decorative */ }
+    // Governor status line in Config, repainted live while the tab is open.
+    store.on('governor:changed', () => {
+      if (this.activeTab === 'config') this._renderGovStatus();
+    });
+
+    // The scheduler announces when an agent starts and stops a tick; the badge
+    // is only useful as a stop button while there is something to stop.
+    store.on('alwaysOn:running', ({ agentId, running } = {}) => {
+      if (!agentId) return;
+      if (running) this._alwaysOnRunning.add(agentId);
+      else this._alwaysOnRunning.delete(agentId);
+      if (this.activeTab === 'agents') this.render();
+    });
+    // A held agent is stopped, not idle-armed: redraw so the badge says so.
+    store.on('alwaysOn:held', (ev = {}) => {
+      // A full list means "this is the authoritative set now" -- used when
+      // restoring from storage and when the master switch clears everyone.
+      // Rebuilding rather than merging is what makes a reload show the badges
+      // the user left behind instead of an empty list.
+      if (Array.isArray(ev.agentIds)) {
+        this._alwaysOnHeld = new Set(ev.agentIds);
+      } else if (ev.agentId) {
+        if (ev.held) this._alwaysOnHeld.add(ev.agentId);
+        else this._alwaysOnHeld.delete(ev.agentId);
+      } else {
+        this._alwaysOnHeld.clear();
+      }
+      if (this.activeTab === 'agents') this.render();
+      else if (this.activeTab === 'config') this._renderAlwaysOnStatus();
+    });
+
+    // Tab navigation
+    document.querySelectorAll('.nav-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        this.activeTab = btn.dataset.tab;
+        store.set('ui.activeTab', this.activeTab);
+        this.render();
+      });
+    });
+
+    // A floating three-dot menu closes on any click outside it. The opener and
+    // the menu's own items stop propagation, so this only fires on outside clicks.
+    document.addEventListener('click', () => this._hideMenu());
+
+    // A press anywhere outside an expanded Config section closes it, so a panel
+    // left open never just sits there. The desktop skin is skipped: its drawer
+    // animates itself shut over 440ms and needs the <details> to stay open for
+    // that, so it runs the same rule in ui/js/desktop2026.js instead.
+    document.addEventListener('pointerdown', (e) => {
+      if (document.documentElement.classList.contains('d26')) return;
+      if (this.activeTab !== 'config' || !this.bodyEl) return;
+      const t = e.target;
+      if (!(t instanceof Element) || t.closest('.cfg-section')) return;
+      this.bodyEl.querySelectorAll('details.cfg-section[open]').forEach(d => { d.open = false; });
+    }, true);
+
+    // Set initial active tab
+    const initialTab = store.get('ui.activeTab') || 'agents';
+    const tabBtn = document.querySelector(`.nav-btn[data-tab="${initialTab}"]`);
+    if (tabBtn) {
+      document.querySelectorAll('.nav-btn').forEach(b => b.classList.remove('active'));
+      tabBtn.classList.add('active');
+      this.activeTab = initialTab;
+    }
+
+    this.render();
+
+    // Working-state tracking: session busy/idle, agent active/idle.
+    // Lights update in place so open menus/inputs are not disturbed.
+    store.on('session:busy', ({ sessionId } = {}) => {
+      this.busySessionId = sessionId || true;
+      this._updateSessionLights();
+    });
+    store.on('session:idle', () => {
+      this.busySessionId = null;
+      this._updateSessionLights();
+    });
+    store.on('agent:status', ({ agentId, status } = {}) => {
+      if (!agentId) return;
+      if (status === 'active' || status === 'thinking') this.workingAgents.add(agentId);
+      else this.workingAgents.delete(agentId);
+      this._updateAgentLights();
+    });
+  }
+
+  _updateSessionLights() {
+    if (!this.bodyEl) return;
+    this.bodyEl.querySelectorAll('[data-session-id]').forEach(row => {
+      const light = row.querySelector('.agent-light');
+      if (!light) return;
+      const isBusy = this.busySessionId && (this.busySessionId === true || row.dataset.sessionId === this.busySessionId);
+      light.className = 'agent-light ' + (isBusy ? 'active' : 'idle');
+    });
+  }
+
+  _updateAgentLights() {
+    if (!this.bodyEl) return;
+    const agents = store.get('agents') || [];
+    agents.forEach(agent => {
+      const light = this.bodyEl.querySelector(`[data-agent-id="${agent.id}"] .agent-light`);
+      if (!light) return;
+      if (this.workingAgents.has(agent.id)) {
+        light.className = 'agent-light active';
+        light.style.background = agent.color;
+        light.style.boxShadow = `0 0 8px ${agent.color}`;
+      } else if (agent.active) {
+        light.className = 'agent-light ready';
+        light.style.background = agent.color;
+        light.style.boxShadow = 'none';
+      } else {
+        light.className = 'agent-light idle';
+        light.style.background = '';
+        light.style.boxShadow = '';
+      }
+    });
+  }
+
+  // ---- Three-dot menus -----------------------------------------------------
+  // The menu is shown as a floating copy in <body>, not inside the card. As an
+  // in-card dropdown it was at the mercy of the stack's scroll container
+  // (clipping) and the next card (stacking); its inline display style was also
+  // being mangled. A body-level overlay with fixed coordinates has none of
+  // those failure modes.
+  _showMenu(btn, sourceMenu) {
+    if (!btn || !sourceMenu) return;
+    const kind = sourceMenu.dataset.kind || '';
+    const owner = sourceMenu.dataset.owner || '';
+    // Clicking the same ⋮ again closes it.
+    if (this._menuEl && this._menuEl.dataset.kind === kind && this._menuEl.dataset.owner === owner) {
+      this._hideMenu();
+      return;
+    }
+    this._hideMenu();
+    const el = sourceMenu.cloneNode(true);
+    el.removeAttribute('id');
+    el.querySelectorAll('[id]').forEach(n => n.removeAttribute('id'));
+    el.classList.add('open', 'd26-float-menu');
+    el.dataset.kind = kind;
+    el.dataset.owner = owner;
+    document.body.appendChild(el);
+    el.style.position = 'fixed';
+    el.style.right = 'auto';
+    // The menus layer, not a number picked to "look high enough". This clone is
+    // body-level, so its z-index competes with the dialogs directly: at 3000 an
+    // agent's ⋮ menu painted over an open dialog (and over the approval veil it
+    // is supposed to defer to). See the ladder in css/modals.css.
+    el.style.zIndex = '1000';
+    const r = btn.getBoundingClientRect();
+    const mw = el.offsetWidth || 160;
+    const mh = el.offsetHeight || 96;
+    const left = Math.min(window.innerWidth - mw - 8, Math.max(8, r.right - mw));
+    let top = r.bottom + 6;
+    if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 6);
+    el.style.left = Math.round(left) + 'px';
+    el.style.top = Math.round(top) + 'px';
+    this._menuEl = el;
+    this._wireMenu(el, kind, owner);
+  }
+
+  _wireMenu(el, kind, owner) {
+    el.querySelectorAll('.agent-menu-item').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const pre = item.dataset.preAction;
+        const action = item.dataset.action;
+        if (pre === 'edit') this._openPrePromptEditor();
+        else if (pre === 'toggle') this._togglePrePrompt();
+        else if (kind === 'agent') {
+          if (action === 'edit') store.emit('agent:edit', owner);
+          else if (action === 'toggle') store.emit('agent:toggle', owner);
+          else if (action === 'delete') store.emit('agent:delete', owner);
+        } else if (kind === 'provider') {
+          if (action === 'edit') store.emit('provider:edit', owner);
+          else if (action === 'toggle') store.emit('provider:toggle', owner);
+          else if (action === 'delete') store.emit('provider:delete', owner);
+        }
+        this._hideMenu();
+      });
+    });
+  }
+
+  _hideMenu() {
+    if (this._menuEl) { this._menuEl.remove(); this._menuEl = null; }
+  }
+
+  render() {
+    switch (this.activeTab) {
+      case 'sessions':
+        this.renderSessions();
+        break;
+      case 'agents':
+        this.renderAgents();
+        break;
+      case 'providers':
+        this.renderProviders();
+        break;
+      case 'config':
+        this.renderConfig();
+        break;
+      case 'proxy':
+        this.renderProxy();
+        break;
+    }
+  }
+
+  renderSessions() {
+    const conversations = store.get('conversations') || [];
+
+    let html = `<div class="sidebar-section-header">
+      <span class="sidebar-section-title">${conversations.length} sessions</span>
+      <button class="btn btn-primary btn-sm" id="addSessionBtn">+ ADD</button>
+    </div>`;
+
+    if (conversations.length === 0) {
+      html += '<div class="empty"><div class="empty-icon">&#9670;</div><div>No sessions yet</div></div>';
+      this.bodyEl.innerHTML = html;
+      document.getElementById('addSessionBtn')?.addEventListener('click', () => this.createSession());
+      return;
+    }
+
+    conversations.forEach(conv => {
+      const initial = (conv.title || '?').charAt(0).toUpperCase();
+      const msgCount = (conv.messages || []).length;
+      const isActive = store.get('currentConversation')?.id === conv.id;
+      html += `<div class="agent-row ${isActive ? 'active' : ''}" data-session-id="${esc(conv.id)}">
+        <div class="agent-avatar" style="border-color:var(--accent-cyan);color:var(--accent-cyan)">${initial}</div>
+        <div class="agent-meta">
+          <div class="agent-name">${esc(conv.title)}</div>
+          <div class="agent-role">${msgCount} messages &middot; ${timeAgo(conv.updatedAt || conv.createdAt)}</div>
+        </div>
+        <button class="agent-menu-btn" data-session-rename="${esc(conv.id)}" title="Rename session">&#9998;</button>
+        <button class="agent-menu-btn" data-session-delete="${esc(conv.id)}" title="Delete session">&times;</button>
+        <div class="agent-light ${this.busySessionId && (this.busySessionId === true || this.busySessionId === conv.id) ? 'active' : 'idle'}"></div>
+      </div>`;
+    });
+
+    this.bodyEl.innerHTML = html;
+
+    // Add click handlers
+    this.bodyEl.querySelectorAll('[data-session-id]').forEach(el => {
+      el.addEventListener('click', (e) => {
+        if (e.target.closest('[data-session-delete]')) return;
+        if (e.target.closest('[data-session-rename]')) return;
+        this.selectSession(el.dataset.sessionId);
+      });
+    });
+
+    // Rename buttons (inline edit)
+    this.bodyEl.querySelectorAll('[data-session-rename]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.startRename(btn.dataset.sessionRename, btn);
+      });
+    });
+
+    // Delete buttons
+    this.bodyEl.querySelectorAll('[data-session-delete]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this.deleteSession(btn.dataset.sessionDelete);
+      });
+    });
+
+    // Add button
+    document.getElementById('addSessionBtn')?.addEventListener('click', () => this.createSession());
+  }
+
+  async createSession() {
+    try {
+      const res = await api.createSession('New Session');
+      const id = res.session_id || res.id;
+      if (id) {
+        await this.loadSessions();
+        store.emit('conversation:loaded', { id });
+        store.emit('toast', { message: 'Session created', type: 'success' });
+      }
+    } catch (err) {
+      console.error('Failed to create session:', err);
+      store.emit('toast', { message: 'Failed to create session', type: 'error' });
+    }
+  }
+
+  startRename(id, btn) {
+    const row = btn.closest('[data-session-id]');
+    const nameEl = row?.querySelector('.agent-name');
+    if (!nameEl) return;
+    const convs = store.get('conversations') || [];
+    const conv = convs.find(c => c.id === id);
+    const current = conv?.title || '';
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.value = current;
+    input.className = 'form-input';
+    input.style.cssText = 'font-size:11px;padding:2px 6px;margin:0';
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const title = input.value.trim();
+      if (save && title && title !== current) {
+        try {
+          await api.updateSession(id, { title });
+          conv.title = title;
+          store.set('conversations', [...convs]);
+          persistence.set('conversations', store.get('conversations'));
+          if (store.get('currentConversation')?.id === id) {
+            store.set('currentConversation', { ...store.get('currentConversation'), title });
+          }
+          store.emit('conversations:changed');
+          store.emit('toast', { message: 'Session renamed', type: 'success' });
+        } catch (err) {
+          console.error('Rename failed:', err);
+          store.emit('toast', { message: 'Rename failed', type: 'error' });
+        }
+      }
+      this.renderSessions();
+    };
+
+    input.addEventListener('keydown', (e) => {
+      e.stopPropagation();
+      if (e.key === 'Enter') finish(true);
+      else if (e.key === 'Escape') finish(false);
+    });
+    input.addEventListener('blur', () => finish(true));
+    input.addEventListener('click', (e) => e.stopPropagation());
+  }
+
+  async deleteSession(id) {    const convs = store.get('conversations') || [];
+    const conv = convs.find(c => c.id === id);
+    try {
+      await api.deleteSession(id);
+      store.set('conversations', convs.filter(c => c.id !== id));
+      persistence.set('conversations', store.get('conversations'));
+      if (store.get('currentConversation')?.id === id) {
+        store.set('currentConversation', null);
+      }
+      store.emit('conversations:changed');
+      store.emit('conversation:closed', { id });
+      this.renderSessions();
+      store.emit('toast', { message: 'Session deleted', type: 'info' });
+    } catch (err) {
+      console.error('Failed to delete session:', err);
+      store.emit('toast', { message: 'Failed to delete session', type: 'error' });
+    }
+  }
+
+  async selectSession(id) {
+    try {
+      const session = await api.getSession(id);
+      if (session && !session.error) {
+        const conv = {
+          id: session.id,
+          title: session.title,
+          createdAt: session.created_at,
+          updatedAt: session.last_activity,
+          active: session.active,
+          messages: this._convertDialogsToMessages(session.dialogs || []),
+          agentsUsed: session.models_used || [],
+        };
+        store.set('currentConversation', conv);
+        store.emit('conversation:loaded', conv);
+        store.emit('toast', { message: `Session: ${conv.title}`, type: 'success' });
+      }
+    } catch (err) {
+      console.error('Failed to load session:', err);
+      store.emit('toast', { message: 'Failed to load session', type: 'error' });
+    }
+  }
+
+  _convertDialogsToMessages(dialogs) {
+    const messages = [];
+    dialogs.forEach(dialog => {
+      messages.push({
+        id: `msg_${dialog.timestamp}_user`,
+        role: 'user',
+        content: dialog.user_input,
+        timestamp: dialog.timestamp * 1000,
+      });
+      if (dialog.responses) {
+        dialog.responses.forEach((resp, i) => {
+          messages.push({
+            id: `msg_${dialog.timestamp}_${i}`,
+            role: 'agent',
+            content: resp.response || resp.error || 'No response',
+            agentId: resp.model_id,
+            reasoning: resp.reasoning || null,
+            toolCalls: resp.tool_calls || resp.toolCalls || null,
+            timestamp: (dialog.timestamp + (i * 0.001)) * 1000,
+          });
+        });
+      }
+    });
+    return messages;
+  }
+
+  renderAgents() {
+    const agents = store.get('agents') || [];
+    const activeCount = agents.filter(a => a.active).length;
+    // Effective override state: armed only when switched on AND holding text.
+    // An active flag with empty text injects nothing, so it shows as off.
+    const pre = store.get('settings.globalPrePrompt') || { text: '', active: false };
+    const preActive = !!(pre.active && (pre.text || '').trim());
+
+    let html = `<div class="sidebar-section-header">
+      <span class="sidebar-section-title">${activeCount} active</span>
+      <span class="preprompt-wrap">
+        <button class="agent-menu-btn preprompt-btn${preActive ? ' armed' : ''}" id="prePromptBtn" title="Global pre-prompt override${preActive ? ' (ON)' : ' (off)'}">§</button>
+        <div class="agent-menu" id="prePromptMenu" data-kind="preprompt">
+          <button class="agent-menu-item" data-pre-action="edit">Edit</button>
+          <button class="agent-menu-item ${preActive ? 'danger' : 'go'}" data-pre-action="toggle">${preActive ? 'Deactivate' : 'Activate'}</button>
+        </div>
+      </span>
+      <button class="btn btn-primary btn-sm" id="addAgentBtn">+ ADD</button>
+    </div>`;
+
+    agents.forEach(agent => {
+      const provider = store.get('providers').find(p => p.id === agent.provider);
+      const working = this.workingAgents.has(agent.id);
+      const lightClass = working ? 'active' : (agent.active ? 'ready' : 'idle');
+      const lightStyle = agent.active || working
+        ? `background:${esc(agent.color)};${working ? `box-shadow:0 0 8px ${esc(agent.color)};` : ''}`
+        : '';
+      html += `<div class="agent-editor" data-agent-id="${esc(agent.id)}">
+        <div class="agent-editor-header">
+          <div class="agent-grip" title="Drag to reorder" aria-label="Drag to reorder ${esc(agent.name)}">&#8942;&#8942;</div>
+          <div class="agent-editor-title" style="color:${esc(agent.color)}">${esc(agent.name)}${agent.label ? ` <span class="agent-label">${esc(agent.label)}</span>` : ''} <span class="agent-code">${esc(agentCode(agent))}</span></div>
+          <div class="agent-editor-actions">
+            ${agent.alwaysOn ? (() => {
+              const held = this._alwaysOnHeld.has(agent.id);
+              const running = this._alwaysOnRunning.has(agent.id);
+              const cls = `always-on-badge${running ? ' running' : ''}${held ? ' held' : ''}`;
+              const tip = held
+                ? `Release ${esc(agent.name)} — it will pick its goal up again`
+                : `Stop ${esc(agent.name)} now — click again to release`;
+              return `<button type="button" class="${cls}" data-always-on-stop="${esc(agent.id)}" title="${tip}" aria-pressed="${held}">${held ? 'HELD' : 'ALWAYS ON'}</button>`;
+            })() : ''}
+            <button class="agent-ask-btn" data-agent-ask="${esc(agent.id)}" title="Ask ${esc(agent.name)} directly">ASK</button>
+            <div class="agent-light ${lightClass}" style="${lightStyle}"></div>
+            <button class="agent-menu-btn" data-agent-menu="${esc(agent.id)}">&#8942;</button>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text-secondary)">
+          ${esc(agent.role)} &middot; ${esc(agent.model)}
+          ${provider ? ' &middot; ' + esc(provider.name) : ''}
+        </div>
+        <div class="agent-clock" data-clock-agent="${esc(agent.id)}" title=""></div>
+        <div class="agent-menu" id="menu-${esc(agent.id)}" data-kind="agent" data-owner="${esc(agent.id)}">
+          <button class="agent-menu-item" data-action="edit">Edit</button>
+          <button class="agent-menu-item" data-action="toggle">${agent.active ? 'Deactivate' : 'Activate'}</button>
+          <button class="agent-menu-item danger" data-action="delete">Delete</button>
+        </div>
+      </div>`;
+    });
+
+    this.bodyEl.innerHTML = html;
+
+    this._attachAgentDragSort();
+
+    // The ALWAYS ON badge stops the current run without switching the agent's
+    // always-on setting off: the next tick picks the goal up again.
+    this.bodyEl.querySelectorAll('[data-always-on-stop]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        store.emit('alwaysOn:stop', { agentId: btn.dataset.alwaysOnStop });
+      });
+    });
+
+    // Clicking an agent's name or code copies it. Bound on the row rather than
+    // the title so it works regardless of which element the click lands on.
+    this.bodyEl.querySelectorAll('.agent-editor').forEach(row => {
+      row.addEventListener('click', (e) => {
+        if (!e.target.closest('.agent-editor-title')) return;
+        const id = row.dataset.agentId;
+        const agent = (store.get('agents') || []).find(a => a.id === id);
+        if (!agent) return;
+        // The code is the permanent handle: names can be duplicated, codes
+        // cannot, and the code is what survives a rename.
+        const text = agentCode(agent);
+        copyToClipboard(text).then(ok => {
+          store.emit('toast', {
+            message: ok ? `Copied ${text}` : 'Could not reach the clipboard',
+            type: ok ? 'success' : 'error',
+          });
+        });
+      });
+    });
+
+    // Ask button: one agent, one question, no fan-out to anyone else.
+    this.bodyEl.querySelectorAll('[data-agent-ask]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        store.emit('agent:ask', btn.dataset.agentAsk);
+      });
+    });
+
+    // Add click handlers for menu buttons
+    this.bodyEl.querySelectorAll('[data-agent-menu]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._showMenu(btn, document.getElementById('menu-' + btn.dataset.agentMenu));
+      });
+    });
+
+    // Add click handlers for menu items. Scoped to agent rows: the header's
+    // pre-prompt menu reuses the same item classes but belongs to no row, so
+    // without the guard every one of its clicks crashed here on a null row.
+    this.bodyEl.querySelectorAll('.agent-editor .agent-menu-item').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const row = item.closest('.agent-editor');
+        if (!row) return;
+        const agentId = row.dataset.agentId;
+        const action = item.dataset.action;
+        if (action === 'edit') {
+          store.emit('agent:edit', agentId);
+        } else if (action === 'toggle') {
+          store.emit('agent:toggle', agentId);
+        } else if (action === 'delete') {
+          store.emit('agent:delete', agentId);
+        }
+        // Close menu
+        const menu = document.getElementById('menu-' + agentId);
+        if (menu) menu.classList.remove('open');
+      });
+    });
+
+    // NOTE: no row-click handler — agent settings open only via the ⋮ button
+    // (menu button + menu items wired above).
+
+    // Add button
+    const addBtn = document.getElementById('addAgentBtn');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => {
+        store.emit('agent:add');
+      });
+    }
+
+    // Global pre-prompt button + menu (same open/close behaviour as agent rows)
+    document.getElementById('prePromptBtn')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this._showMenu(e.currentTarget, document.getElementById('prePromptMenu'));
+    });
+    // API Lab and Brain Lab now live in the apps notch under the header, so the
+    // sidebar no longer carries their buttons.
+    document.querySelectorAll('#prePromptMenu [data-pre-action]').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const action = item.dataset.preAction;
+        const menu = document.getElementById('prePromptMenu');
+        if (menu) menu.classList.remove('open');
+        if (action === 'edit') this._openPrePromptEditor();
+        else if (action === 'toggle') this._togglePrePrompt();
+      });
+    });
+    // Paint the token clocks into the rows just built. Metrics and governor
+    // events repaint them afterwards; this covers the first render.
+    try { refreshAgentClocks(); } catch { /* clocks are decorative */ }
+  }
+
+  /**
+   * Flip the global pre-prompt override. With no text saved there is nothing
+   * to turn on, so Activate opens the editor instead of arming an empty
+   * prompt that would inject nothing.
+   */
+  _togglePrePrompt() {
+    const cur = store.get('settings.globalPrePrompt') || { text: '', active: false, mode: 'prepend' };
+    const text = cur.text || '';
+    const mode = cur.mode === 'replace' ? 'replace' : 'prepend';
+    if (cur.active && text.trim()) {
+      store.set('settings.globalPrePrompt', { text, active: false, mode });
+      store.emit('toast', { message: 'Global pre-prompt off', type: 'info' });
+    } else if (text.trim()) {
+      store.set('settings.globalPrePrompt', { text, active: true, mode });
+      store.emit('toast', {
+        message: `Global pre-prompt ON — ${mode === 'replace' ? 'replaces' : 'prepends to'} every agent's own prompt`,
+        type: 'success',
+      });
+    } else {
+      this._openPrePromptEditor();
+      return;
+    }
+    persistence.set('settings', store.get('settings'));
+    this.renderAgents();
+  }
+
+  /**
+   * Popup editor for the override text. Save stores the text and arms the
+   * override whenever there is anything to inject; saving empty (or clearing
+   * the box) disarms it. Cancel changes nothing. The bottom-left switch picks
+   * whether the override PREPENDS to (default) or REPLACES the agent's prompt.
+   */
+  _openPrePromptEditor() {
+    const cur = store.get('settings.globalPrePrompt') || { text: '', active: false, mode: 'prepend' };
+    let replace = cur.mode === 'replace';
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-header">
+          <span class="modal-title">Global pre-prompt override</span>
+          <button class="modal-close" id="prePromptClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-hint" id="prePromptHint" style="margin-bottom:8px"></div>
+          <textarea class="form-textarea" id="prePromptText" rows="6"
+            placeholder="e.g. Always explain your reasoning before answering."></textarea>
+        </div>
+        <div class="modal-footer pre-prompt-footer">
+          <div class="pre-prompt-mode">
+            <span class="form-hint-inline">Mode</span>
+            <div class="toggle" id="prePromptMode" role="switch" aria-checked="false" tabindex="0" title="Off = prepend, On = replace">
+              <div class="toggle-knob"></div>
+            </div>
+            <span class="pre-prompt-mode-label" id="prePromptModeLabel">Prepend</span>
+          </div>
+          <div class="pre-prompt-actions">
+            <button class="btn btn-ghost" id="prePromptCancel">Cancel</button>
+            <button class="btn btn-primary" id="prePromptSave">Save</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const close = () => overlay.remove();
+    overlay.querySelector('#prePromptClose').addEventListener('click', close);
+    overlay.querySelector('#prePromptCancel').addEventListener('click', close);
+    overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    const ta = overlay.querySelector('#prePromptText');
+    ta.value = cur.text || '';
+    ta.focus();
+
+    // The switch is the one place replace/prepend is chosen, so the hint above
+    // the box and the label beside it always describe the current choice.
+    const hint = overlay.querySelector('#prePromptHint');
+    const modeEl = overlay.querySelector('#prePromptMode');
+    const modeLabel = overlay.querySelector('#prePromptModeLabel');
+    const syncMode = () => {
+      modeEl.classList.toggle('active', replace);
+      modeEl.setAttribute('aria-checked', String(replace));
+      modeLabel.textContent = replace ? 'Replace' : 'Prepend';
+      hint.textContent = replace
+        ? "Replaces every agent's own system prompt while active — main chat, ask-directly and routing-chart runs alike. Stored custom prompts are untouched and return when this is switched off."
+        : "Prepended in front of every agent's own system prompt while active — main chat, ask-directly and routing-chart runs alike. The agent's own prompt still follows.";
+    };
+    const flip = () => { replace = !replace; syncMode(); };
+    modeEl.addEventListener('click', flip);
+    modeEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); flip(); }
+    });
+    syncMode();
+
+    overlay.querySelector('#prePromptSave').addEventListener('click', () => {
+      const text = ta.value;
+      const active = !!text.trim();
+      const mode = replace ? 'replace' : 'prepend';
+      store.set('settings.globalPrePrompt', { text, active, mode });
+      persistence.set('settings', store.get('settings'));
+      store.emit('toast', {
+        message: active
+          ? `Global pre-prompt saved and ON — ${mode === 'replace' ? 'replaces' : 'prepends to'} every agent's own prompt`
+          : 'Global pre-prompt cleared and off',
+        type: active ? 'success' : 'info',
+      });
+      close();
+      this.renderAgents();
+    });
+  }
+
+  /**
+   * Proxy tab: fetch elite/anonymous proxies, ping them, save favorites,
+   * and route the app's outbound relay traffic through the selected one.
+   */
+  async renderProxy() {
+    this.bodyEl.innerHTML = `
+      <div class="proxy-header">
+        <button class="btn btn-primary btn-sm" id="proxyRefresh">Refresh List</button>
+        <button class="btn btn-secondary btn-sm" id="proxyPingAll">Ping All</button>
+        <button class="btn btn-secondary btn-sm" id="proxyClear">Clear Selection</button>
+        <label class="proxy-filter">
+          <input type="checkbox" id="proxyHideDead">
+          <span>Working only</span>
+        </label>
+      </div>
+      <div class="proxy-stats" id="proxyStats"></div>
+      <div class="proxy-list" id="proxyList">Loading…</div>
+    `;
+
+    document.getElementById('proxyRefresh')?.addEventListener('click', () => this._fetchProxies());
+    document.getElementById('proxyPingAll')?.addEventListener('click', () => this._pingAllProxies());
+    document.getElementById('proxyClear')?.addEventListener('click', () => this._clearActiveProxy());
+    document.getElementById('proxyHideDead')?.addEventListener('change', (e) => {
+      this._hideDeadProxies = e.target.checked;
+      this._renderProxyList();
+    });
+
+    await this._fetchProxies();
+  }
+
+  async _fetchProxies() {
+    const listEl = document.getElementById('proxyList');
+    const statsEl = document.getElementById('proxyStats');
+    listEl.innerHTML = '<div class="proxy-loading">Fetching proxy list…</div>';
+    statsEl.textContent = '';
+
+    try {
+      const res = await api.getProxies();
+      if (!res.ok) throw new Error(res.error || 'Failed to fetch proxies');
+      this._proxies = res.proxies || [];
+      this._renderProxyList();
+      const st = res.stats || {};
+      // Say what was dropped rather than showing a mysteriously shorter list.
+      const dropped = [];
+      if (st.not_ipv4) dropped.push(`${st.not_ipv4} non-IPv4`);
+      if (st.not_anonymous) dropped.push(`${st.not_anonymous} not anonymous`);
+      if (st.not_alive) dropped.push(`${st.not_alive} dead`);
+      statsEl.textContent = `${this._proxies.length} IPv4 proxies (elite + anonymous)`
+        + (dropped.length ? ` — filtered out ${dropped.join(', ')}` : '');
+    } catch (err) {
+      listEl.innerHTML = `<div class="proxy-error">Error: ${err.message}</div>`;
+    }
+  }
+
+  _renderProxyList() {
+    const listEl = document.getElementById('proxyList');
+    if (!this._proxies?.length) {
+      listEl.innerHTML = '<div class="proxy-empty">No proxies found.</div>';
+      return;
+    }
+
+    const activeId = store.get('settings.proxyActive') || '';
+    const favorites = store.get('settings.proxyFavorites') || [];
+
+    // "Working only" hides everything that failed a ping. On a free list
+    // that is the great majority, and a dead entry in the list is worse than
+    // no entry: it looks selectable, and selecting it breaks every call.
+    // Only meaningful once Ping All has run, so it stays a deliberate choice.
+    let pool = this._proxies;
+    const hideDead = this._hideDeadProxies;
+    if (hideDead) {
+      pool = pool.filter(p => typeof p.pingMs === 'number' && p.pingMs >= 0);
+      // The ACTIVE proxy is never hidden, even when it failed. Filtering it out
+      // would leave traffic routed through a dead proxy with no row on screen
+      // to notice it or clear it -- the filter would make the problem harder
+      // to see, which is the opposite of its purpose.
+      const active = this._proxies.find(p => p.proxy === activeId);
+      if (active && !pool.includes(active)) pool.push(active);
+    }
+    if (!pool.length) {
+      const pinged = this._proxies.some(p => typeof p.pingMs === 'number');
+      listEl.innerHTML = `<div class="proxy-empty">${
+        pinged ? 'No proxies answered. Run Ping All again, or untick "Working only".'
+               : 'Run Ping All first — nothing has been tested yet.'
+      }</div>`;
+      return;
+    }
+
+    // Sort: active first, then favorites, then by ping (ascending, null last)
+    const sorted = [...pool].sort((a, b) => {
+      const aActive = a.proxy === activeId;
+      const bActive = b.proxy === activeId;
+      if (aActive !== bActive) return aActive ? -1 : 1;
+      const aFav = favorites.includes(a.proxy);
+      const bFav = favorites.includes(b.proxy);
+      if (aFav !== bFav) return aFav ? -1 : 1;
+      const aPing = a.pingMs ?? Infinity;
+      const bPing = b.pingMs ?? Infinity;
+      return aPing - bPing;
+    });
+
+    listEl.innerHTML = sorted.map(p => this._renderProxyRow(p, activeId, favorites)).join('');
+
+    // Bind events
+    listEl.querySelectorAll('.proxy-ping').forEach(btn => {
+      btn.addEventListener('click', (e) => this._pingProxy(e.currentTarget.dataset.proxy));
+    });
+    listEl.querySelectorAll('.proxy-fav').forEach(btn => {
+      btn.addEventListener('click', (e) => this._toggleFavorite(e.currentTarget.dataset.proxy));
+    });
+    listEl.querySelectorAll('.proxy-select').forEach(btn => {
+      btn.addEventListener('click', (e) => this._setActiveProxy(e.currentTarget.dataset.proxy));
+    });
+    listEl.querySelectorAll('.proxy-remove').forEach(btn => {
+      btn.addEventListener('click', (e) => this._removeProxy(e.currentTarget.dataset.proxy));
+    });
+  }
+
+  _renderProxyRow(p, activeId, favorites) {
+    const isActive = p.proxy === activeId;
+    const isFav = favorites.includes(p.proxy);
+    const pingHtml = p.pingMs !== undefined
+      ? `<span class="proxy-ping-value ${p.pingMs < 500 ? 'fast' : p.pingMs < 1500 ? 'medium' : 'slow'}">${p.pingMs} ms</span>`
+      : `<span class="proxy-ping-value unknown">—</span>`;
+    const anonBadge = p.anonymity === 'elite' ? 'elite' : 'anonymous';
+    const country = p.country || '—';
+    const ssl = p.ssl ? '🔒' : '';
+    const uptime = p.uptime !== undefined ? `${p.uptime.toFixed(1)}%` : '—';
+
+    return `
+      <div class="proxy-row ${isActive ? 'active' : ''}" data-proxy="${p.proxy}">
+        <div class="proxy-main">
+          <div class="proxy-addr">
+            <strong>${p.ip}:${p.port}</strong>
+            <span class="proxy-ssl">${ssl}</span>
+          </div>
+          <div class="proxy-meta">
+            <span class="proxy-anon ${anonBadge}">${anonBadge}</span>
+            <span class="proxy-country">${country}</span>
+            <span class="proxy-uptime">${uptime} uptime</span>
+          </div>
+        </div>
+        <div class="proxy-actions">
+          ${pingHtml}
+          <button class="btn-proxy proxy-ping" data-proxy="${p.proxy}" ${p.pinging ? 'disabled' : ''} title="Ping this proxy">
+            ${p.pinging ? '⏳' : '🏓'}
+          </button>
+          <button class="btn-proxy proxy-fav ${isFav ? 'active' : ''}" data-proxy="${p.proxy}" title="Toggle favorite">
+            ${isFav ? '★' : '☆'}
+          </button>
+          <button class="btn-proxy proxy-select ${isActive ? 'active' : ''}" data-proxy="${p.proxy}" ${isActive ? 'disabled' : ''} title="${isActive ? 'Active' : 'Use this proxy'}">
+            ${isActive ? '✓ Active' : 'Use'}
+          </button>
+          <button class="btn-proxy proxy-remove" data-proxy="${p.proxy}" title="Remove from list">
+            ✕
+          </button>
+        </div>
+      </div>
+    `;
+  }
+
+  async _pingProxy(proxyStr) {
+    const [ip, port] = proxyStr.split(':');
+    const rowEl = document.querySelector(`.proxy-row[data-proxy="${proxyStr}"]`);
+    const pingEl = rowEl?.querySelector('.proxy-ping-value');
+    const btnEl = rowEl?.querySelector('.proxy-ping');
+
+    if (!rowEl || !pingEl || !btnEl) return;
+
+    btnEl.disabled = true;
+    btnEl.textContent = '⏳';
+    pingEl.textContent = '…';
+    pingEl.className = 'proxy-ping-value';
+
+    try {
+      const res = await api.pingProxy(ip, parseInt(port, 10));
+      if (res.ok) {
+        // Update local array
+        const p = this._proxies.find(x => x.proxy === proxyStr);
+        if (p) p.pingMs = res.pingMs;
+        // Re-render just the ping value with color
+        pingEl.textContent = `${res.pingMs} ms`;
+        pingEl.className = `proxy-ping-value ${res.pingMs < 500 ? 'fast' : res.pingMs < 1500 ? 'medium' : 'slow'}`;
+      } else {
+        pingEl.textContent = '✕ failed';
+        pingEl.className = 'proxy-ping-value slow';
+      }
+    } catch (err) {
+      pingEl.textContent = '✕ error';
+      pingEl.className = 'proxy-ping-value slow';
+    } finally {
+      btnEl.disabled = false;
+      btnEl.textContent = '🏓';
+    }
+  }
+
+  async _pingAllProxies() {
+    const btnEl = document.getElementById('proxyPingAll');
+    if (!this._proxies?.length) {
+      store.emit('toast', { message: 'No proxies loaded — click Refresh List first', type: 'error' });
+      return;
+    }
+    btnEl.disabled = true;
+    btnEl.textContent = 'Pinging…';
+
+    const started = Date.now();
+    try {
+      // One request. The server pings the whole list concurrently with
+      // curl_multi and returns them fastest-first. The old loop issued one
+      // request per proxy, in series, each with a 15s timeout -- up to 64
+      // minutes for 255 proxies, which is why the button looked dead.
+      const res = await api.pingProxiesBatch(
+        this._proxies.map(p => ({ ip: p.ip, port: parseInt(p.port, 10) }))
+      );
+      const byKey = new Map((res.results || []).map(r => [`${r.ip}:${r.port}`, r.pingMs]));
+      let alive = 0;
+      for (const p of this._proxies) {
+        const ms = byKey.get(`${p.ip}:${p.port}`);
+        p.pingMs = (ms === null || ms === undefined) ? -1 : ms;
+        if (p.pingMs >= 0) alive++;
+      }
+      this._renderProxyList();
+      store.emit('toast', {
+        message: `${alive} of ${this._proxies.length} proxies answered in ${Math.round((Date.now() - started) / 1000)}s`,
+        type: alive ? 'success' : 'error',
+      });
+    } catch (err) {
+      store.emit('toast', { message: `Ping all failed: ${err.message}`, type: 'error' });
+    } finally {
+      btnEl.disabled = false;
+      btnEl.textContent = 'Ping All';
+    }
+  }
+
+  _toggleFavorite(proxyStr) {
+    const favorites = store.get('settings.proxyFavorites') || [];
+    const idx = favorites.indexOf(proxyStr);
+    if (idx >= 0) favorites.splice(idx, 1);
+    else favorites.push(proxyStr);
+    store.set('settings.proxyFavorites', favorites);
+    persistence.set('settings', store.get('settings'));
+    this._renderProxyList();
+  }
+
+  /**
+   * Select a proxy, or deselect it by clicking it again.
+   *
+   * Toggling matters because "route everything through a proxy" is a state you
+   * want to LEAVE. With no way back, a stale selection silently keeps sending
+   * every agent call through a proxy that may since have died.
+   */
+  async _setActiveProxy(proxyStr) {
+    const p = this._proxies.find(x => x.proxy === proxyStr);
+    if (!p) return;
+
+    const wasActive = (store.get('settings.proxyActive') || '') === proxyStr;
+    const next = wasActive ? '' : proxyStr;
+
+    store.set('settings.proxyActive', next);
+    persistence.set('settings', store.get('settings'));
+    try {
+      // Server-side too: the relay runs here, so a browser-only setting would
+      // change nothing about where traffic actually goes.
+      await api.setActiveProxy(next);
+    } catch (err) {
+      store.emit('toast', { message: `Proxy selection not saved: ${err.message}`, type: 'error' });
+    }
+    store.emit('toast', {
+      message: next ? `Active proxy: ${next}` : 'Proxy cleared — traffic is direct again',
+      type: next ? 'success' : 'info',
+    });
+    this._renderProxyList();
+  }
+
+  /**
+   * Clear the proxy on BOTH sides, and say only what actually happened.
+   *
+   * This used to write the browser setting and nothing else, then toast "Proxy
+   * cleared — using direct connection". The relay runs on the server, where
+   * `sandbox.proxy_active` was still set, so every model call kept going
+   * through a proxy the tab said was gone -- and a dead one broke the local
+   * runner with nothing on screen to explain it. Selecting a proxy always
+   * wrote both; clearing has to as well.
+   */
+  async _clearActiveProxy() {
+    store.set('settings.proxyActive', '');
+    persistence.set('settings', store.get('settings'));
+    this._renderProxyList();
+    try {
+      await api.setActiveProxy('');
+      store.emit('toast', { message: 'Proxy cleared — using direct connection', type: 'info' });
+    } catch (err) {
+      // Unknown is not cleared: the server may still be routing through it.
+      store.emit('toast', {
+        message: `Proxy cleared here, but the server did not confirm: ${err.message}`,
+        type: 'error',
+      });
+    }
+  }
+
+  _removeProxy(proxyStr) {
+    this._proxies = this._proxies.filter(x => x.proxy !== proxyStr);
+    const favorites = store.get('settings.proxyFavorites') || [];
+    store.set('settings.proxyFavorites', favorites.filter(x => x !== proxyStr));
+    persistence.set('settings', store.get('settings'));
+    // Removing the ACTIVE proxy is the same problem as clearing it: the list
+    // entry goes, the server keeps routing through it.
+    if (store.get('settings.proxyActive') === proxyStr) {
+      this._clearActiveProxy();
+      return;
+    }
+    this._renderProxyList();
+  }
+
+  /**
+   * Drag-to-reorder for the agent list.
+   *
+   * Pointer events rather than HTML5 drag-and-drop, because HTML5 DnD does not
+   * fire on touch at all and this list is usable on a phone. The dragged row is
+   * moved through the DOM as the pointer crosses each neighbour's midpoint, and
+   * translated to stay under the cursor, so the row you grabbed is the row that
+   * moves.
+   *
+   * The grip is the primary handle because `touch-action: none` on it leaves
+   * the rest of the row free to scroll normally; dragging by the header also
+   * works for the mouse.
+   */
+  _attachAgentDragSort() {
+    const rows = Array.from(this.bodyEl.querySelectorAll('.agent-editor'));
+    rows.forEach(row => {
+      const grip = row.querySelector('.agent-grip');
+      const header = row.querySelector('.agent-editor-header');
+      [grip, header].filter(Boolean).forEach(handle => {
+        handle.addEventListener('pointerdown', (e) => {
+          // Buttons and menus keep their own behaviour.
+          if (e.target.closest('button, .agent-menu, input, select, textarea')) return;
+          this._startAgentDrag(e, row);
+        });
+      });
+    });
+  }
+
+  _startAgentDrag(e, row) {
+    if (this._drag) return; // one drag at a time
+    const pointerId = e.pointerId;
+    const startY = e.clientY;
+    const isTouch = e.pointerType === 'touch';
+    // A touch needs a moment's hold so a scroll is never mistaken for a drag.
+    const threshold = isTouch ? 8 : 5;
+    const rect = row.getBoundingClientRect();
+    const grabOffset = startY - rect.top;
+    // Element references, not ids: restoring a cancelled drag should not depend
+    // on CSS.escape or on building an attribute selector from an id.
+    const originalOrder = Array.from(
+      this.bodyEl.querySelectorAll('.agent-editor')
+    );
+
+    const state = { row, pointerId, startY, grabOffset, active: false, originalOrder };
+    this._drag = state;
+
+    // Deliberately no setPointerCapture: with capture active the browser
+    // retargets the follow-up click to the capturing element, so a click on the
+    // agent's name would never reach the copy handler. Tracking on window
+    // already keeps working outside the element.
+    const move = (ev) => this._onAgentDragMove(ev, state, threshold);
+    const up = (ev) => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('pointercancel', cancel);
+      window.removeEventListener('keydown', onKey, true);
+      this._finishAgentDrag(state, ev.type === 'pointercancel');
+    };
+    const cancel = () => up({ type: 'pointercancel' });
+    const onKey = (ev) => {
+      if (ev.key === 'Escape') { ev.preventDefault(); cancel(); }
+    };
+
+    state.move = move;
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+    window.addEventListener('pointercancel', cancel);
+    window.addEventListener('keydown', onKey, true);
+    // Keep the browser from scrolling the panel out from under the drag.
+    if (isTouch) e.preventDefault();
+  }
+
+  _onAgentDragMove(e, state, threshold) {
+    if (e.pointerId !== state.pointerId) return;
+    const dy = e.clientY - state.startY;
+    if (!state.active) {
+      if (Math.abs(dy) < threshold) return; // still just a click
+      state.active = true;
+      state.row.classList.add('agent-dragging');
+      document.body.classList.add('agent-reordering');
+    }
+    e.preventDefault();
+
+    const row = state.row;
+    const siblings = Array.from(
+      this.bodyEl.querySelectorAll('.agent-editor')
+    ).filter(r => r !== row);
+
+    // Drop into whichever neighbour the pointer is above the midpoint of.
+    let placed = false;
+    for (const sib of siblings) {
+      const r = sib.getBoundingClientRect();
+      if (e.clientY < r.top + r.height / 2) {
+        this.bodyEl.insertBefore(row, sib);
+        placed = true;
+        break;
+      }
+    }
+    if (!placed) this.bodyEl.appendChild(row);
+
+    // Re-measure with the transform cleared: reading the rect while it is
+    // applied would feed its own offset back in and drift.
+    row.style.transform = 'none';
+    const base = row.getBoundingClientRect().top;
+    row.style.transform = `translateY(${e.clientY - state.grabOffset - base}px)`;
+  }
+
+  _finishAgentDrag(state, cancelled) {
+    this._drag = null;
+    const row = state.row;
+    document.body.classList.remove('agent-reordering');
+    row.classList.remove('agent-dragging');
+    row.style.transform = '';
+
+    const currentOrder = Array.from(
+      this.bodyEl.querySelectorAll('.agent-editor')
+    ).map(r => r.dataset.agentId);
+    const originalIds = state.originalOrder.map(r => r.dataset.agentId);
+    const unchanged = currentOrder.every((id, i) => id === originalIds[i]);
+
+    if (cancelled || unchanged) {
+      // Put it back where it started rather than leaving a cancelled drag
+      // half-applied.
+      state.originalOrder.forEach(el => this.bodyEl.appendChild(el));
+      // No re-render here: nothing moved, so the DOM is already correct. It
+      // would also replace this row's elements, and the click that follows a
+      // plain press on the agent's name would land on a detached node.
+      return;
+    }
+    this._commitAgentOrder(currentOrder);
+  }
+
+  /** Persist a new agent order and let the rest of the app react. */
+  _commitAgentOrder(order) {
+    const agents = [...(store.get('agents') || [])];
+    const byId = new Map(agents.map(a => [a.id, a]));
+    const reordered = order.map(id => byId.get(id)).filter(Boolean);
+    // Anything not rendered (shouldn't happen) keeps its place at the end
+    // rather than being silently dropped from the roster.
+    agents.forEach(a => { if (!order.includes(a.id)) reordered.push(a); });
+
+    persistence.set('agents', reordered);
+    store.emit('agents:changed', { reordered: true });
+    this.render();
+  }
+
+  /** Say what always-on will actually do, so the numbers are never a surprise. */
+  _renderAlwaysOnStatus() {
+    const el = document.getElementById('sbAlwaysOnStatus');
+    if (!el) return;
+    const s = store.get('settings') || {};
+    const eligible = (store.get('agents') || []).filter(
+      a => a && a.alwaysOn && a.active && String(a.alwaysOnGoal || '').trim()
+    );
+    // Held agents are excluded from every tick, so say so and offer the way
+    // out. A cap (Max iterations / Max minutes) or a click on an ALWAYS ON
+    // badge parks the agent; the hold is saved and survives a reload, which
+    // without this line read as always-on having switched itself off.
+    const held = this._alwaysOnHeld ? this._alwaysOnHeld.size : 0;
+    const releaseBtn = document.getElementById('sbAlwaysOnRelease');
+    if (releaseBtn) releaseBtn.style.display = held ? 'block' : 'none';
+    const heldNote = held ? ` ${held} are stopped and held — release them below.` : '';
+    if (!s.alwaysOn) {
+      el.textContent = eligible.length
+        ? `${eligible.length} agent(s) have a standing goal. Switch on to let them work.${heldNote}`
+        : 'Give an agent a standing goal in its editor, then switch this on.';
+      return;
+    }
+    if (!eligible.length) {
+      el.textContent = held
+        ? `Switched on, but every agent with a goal is stopped and held.${heldNote}`
+        : 'Switched on, but no agent has a standing goal yet.';
+      return;
+    }
+    const every = Math.max(10, parseInt(s.alwaysOnIntervalSec, 10) || 30);
+    // ~3500 tokens a turn is a fair average for this app's agent prompts.
+    const perHour = (3600 / every) * eligible.length;
+    // A cap stops and HOLDS the agent (that is the point -- it is the spend
+    // guard). Say so, and call out the footgun where the cadence is longer than
+    // the minute cap, so the roster is parked after a single tick.
+    const iters = parseInt(s.alwaysOnMaxIterations, 10) || 0;
+    const mins = parseInt(s.alwaysOnMaxMinutes, 10) || 0;
+    let capNote = '';
+    if (iters || mins) {
+      const caps = [iters && `${iters} iteration(s)`, mins && `${mins} minute(s)`].filter(Boolean).join(' / ');
+      const oneTick = (mins && mins * 60 <= every) || iters === 1;
+      capNote = ` Each agent is then stopped and HELD after ${caps}.`
+        + (oneTick
+          ? ' That is only the first tick at this cadence — set the caps to 0 (Limits & Budgets) to loop forever.'
+          : '');
+    }
+    el.textContent = `Running for ${eligible.length} agent(s) every ${every}s — roughly `
+      + `${Math.round(perHour)} turns/hour. Each turn is billed by your provider.${heldNote}${capNote}`;
+  }
+
+  renderProviders() {
+    const providers = store.get('providers') || [];
+
+    let html = `<div class="sidebar-section-header">
+      <span class="sidebar-section-title">${providers.length} providers</span>
+      <button class="btn btn-primary btn-sm" id="addProviderBtn">+ ADD</button>
+    </div>`;
+
+    providers.forEach(provider => {
+      html += `<div class="provider-card" data-provider-id="${esc(provider.id)}">
+        <div class="provider-card-header">
+          <div class="provider-name">${esc(provider.name)}</div>
+          <div class="provider-card-actions">
+            <div class="provider-status ${provider.active ? '' : 'inactive'}" style="pointer-events:none">${provider.active ? 'ACTIVE' : 'INACTIVE'}</div>
+            <button class="provider-menu-btn" data-provider-menu="${esc(provider.id)}" title="Provider settings">&#8942;</button>
+          </div>
+        </div>
+        <div style="font-size:10px;color:var(--text-secondary);word-break:break-all">${esc(provider.endpoint)}</div>
+        <div style="font-size:9px;color:var(--text-dim);margin-top:4px">${provider.models.length} models &middot; ${esc(provider.authType)}</div>
+        <div class="agent-menu" id="menu-${esc(provider.id)}" data-kind="provider" data-owner="${esc(provider.id)}">
+          <button class="agent-menu-item" data-action="edit">Edit</button>
+          <button class="agent-menu-item" data-action="toggle">${provider.active ? 'Deactivate' : 'Activate'}</button>
+          <button class="agent-menu-item danger" data-action="delete">Delete</button>
+        </div>
+      </div>`;
+    });
+
+    this.bodyEl.innerHTML = html;
+
+    // Add click handlers for menu buttons
+    this.bodyEl.querySelectorAll('[data-provider-menu]').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        this._showMenu(btn, document.getElementById('menu-' + btn.dataset.providerMenu));
+      });
+    });
+
+    // Add click handlers for menu items
+    this.bodyEl.querySelectorAll('.provider-card .agent-menu-item').forEach(item => {
+      item.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const providerId = item.closest('.provider-card').dataset.providerId;
+        const action = item.dataset.action;
+        if (action === 'edit') {
+          store.emit('provider:edit', providerId);
+        } else if (action === 'toggle') {
+          store.emit('provider:toggle', providerId);
+        } else if (action === 'delete') {
+          store.emit('provider:delete', providerId);
+        }
+        // Close menu
+        const menu = document.getElementById('menu-' + providerId);
+        if (menu) menu.classList.remove('open');
+      });
+    });
+
+    // NOTE: no row-click handler — provider settings open only via the ⋮ button
+    // (menu button + menu items wired above).
+
+    // Add button
+    const addBtn = document.getElementById('addProviderBtn');
+    if (addBtn) {
+      addBtn.addEventListener('click', () => {
+        store.emit('provider:add');
+      });
+    }
+  }
+
+  /**
+   * One collapsible Config section.
+   *
+   * Native <details>/<summary> rather than a JS-driven accordion: the open
+   * state, the tap behaviour, the keyboard path and the screen-reader
+   * semantics are then the platform's, and all this has to do is decide
+   * whether it starts open. Bodies stay in the DOM whether open or not, which
+   * is what keeps the async status lines (project dir, exec, governor,
+   * always-on) populating inside a collapsed section.
+   *
+   * The whole header is the tap target — 40px tall on a phone, where a 10px
+   * label is not something you can hit with a thumb.
+   */
+  _cfgSection(id, label, badge, body) {
+    const b = badge && badge.text
+      ? `<span class="cfg-section-badge ${badge.cls || ''}">${esc(badge.text)}</span>`
+      : '';
+    return `
+      <details class="cfg-section" data-cfg-section="${esc(id)}"${this._cfgOpen.has(id) ? ' open' : ''}>
+        <summary class="cfg-section-head">
+          <span class="cfg-chevron" aria-hidden="true">▸</span>
+          <span class="cfg-section-title">${esc(label)}</span>
+          ${b}
+        </summary>
+        <div class="cfg-body">${body}</div>
+      </details>`;
+  }
+
+  /**
+   * Rescue numbers typed but not yet saved, before the DOM is rebuilt.
+   *
+   * renderConfig() replaces innerHTML every time the tab is opened, and the
+   * numbers only land on SAVE -- so switching tabs mid-edit used to discard
+   * them silently. They are written into the store here (NOT persisted: SAVE
+   * still owns that), which means they survive the rebuild, still show as
+   * unsaved, and still need SAVE to become real.
+   */
+  _commitPendingCfgFields() {
+    const num = (id, min, max, fallback) => {
+      const el = document.getElementById(id);
+      if (!el) return null;
+      const n = parseFloat(el.value);
+      if (!Number.isFinite(n)) return null;
+      return Math.max(min, Math.min(max, n));
+    };
+    const put = (key, value) => {
+      if (value === null) return;
+      if (store.get('settings.' + key) !== value) store.set('settings.' + key, value);
+    };
+    put('temperature', num('sbTemp', 0, 2, 1));
+    put('maxTokens', num('sbMaxTokens', 256, 131072, 16384));
+    put('alwaysOnIntervalSec', num('sbAlwaysOnInterval', 10, 3600, 30));
+    put('alwaysOnGraceSec', num('sbAlwaysOnGrace', 0, 3600, 20));
+    put('alwaysOnMaxIterations', num('sbAlwaysOnMaxIter', 0, 10000, 0));
+    put('alwaysOnMaxMinutes', num('sbAlwaysOnMaxMin', 0, 100000, 0));
+    put('rateLimitRpm', num('sbGovRpm', 0, 600, 0));
+    put('rateLimitMaxWaitMs', num('sbGovMaxWait', 5, 600, 65) * 1000);
+    put('tokenBudget', num('sbTokenBudget', 0, 1000000000, 0));
+
+    // The project directory lives on the server and is fetched back on every
+    // render, so it cannot be rescued the same way: the typed text is held
+    // here and _loadProjectDir puts it back into the rebuilt field.
+    const dirEl = document.getElementById('sbProjectDir');
+    if (dirEl) {
+      const typed = dirEl.value.trim();
+      if (typed !== (store.get('settings.projectDir') || '').trim()) {
+        this._cfgPendingDir = typed;
+      } else {
+        this._cfgPendingDir = null;
+      }
+    }
+  }
+
+  renderConfig() {
+    // Rescue any pending edits FIRST: `settings` is read immediately after
+    // this, so committing afterwards would rebuild the fields from the old
+    // values and undo the rescue it just performed.
+    this._commitPendingCfgFields();
+    const settings = store.get('settings');
+    const rm = settings.resourceManager || {};
+
+    // Numbers typed into a field and not yet saved were rescued at the top of
+    // this method, before `settings` was read -- see _commitPendingCfgFields().
+
+    const themeLabel = { dark: 'Dark', matrix: 'Matrix', cyberpunk: 'Cyberpunk' }[settings.theme] || 'Dark';
+    const iface = normalizeIface(settings.interfaceMode);
+    // Reasoning panels: true = always open, false = always collapsed, 'auto'
+    // (or absent) = the length rule. One key with three meanings, so a click on
+    // a panel and this switch cannot drift apart.
+    const reasoningMode = settings.reasoningOpen === true ? 'open'
+      : (settings.reasoningOpen === false ? 'closed' : 'auto');
+const ghost = { on: true, color: '#a8c0d8', size: 11, opacity: 0.3, ...(settings.chartGhost || {}) };
+    const mem = settings.historyTurns ?? DEFAULT_HISTORY_TURNS;
+    const rpm = Number(settings.rateLimitRpm) || 0;
+
+    this.bodyEl.innerHTML = `
+      ${this._cfgSection('iface', 'Interface', {
+        text: `${iface === 'desktop' ? 'Desktop 2026' : 'Classic'} · ${themeLabel}`,
+      }, `
+        <div class="form-group">
+          <label class="form-label">Theme</label>
+          <select class="form-select" id="sbTheme">
+            <option value="dark" ${settings.theme === 'dark' ? 'selected' : ''}>Dark</option>
+            <option value="matrix" ${settings.theme === 'matrix' ? 'selected' : ''}>Matrix</option>
+            <option value="cyberpunk" ${settings.theme === 'cyberpunk' ? 'selected' : ''}>Cyberpunk</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Interface <span class="form-hint-inline">${iface === 'desktop' ? 'glass shell' : 'both panels'}</span></label>
+          <select class="form-select" id="sbIface">
+            <option value="classic" ${iface === 'classic' ? 'selected' : ''}>Classic — setup, chat and map panels side by side</option>
+            <option value="desktop" ${iface === 'desktop' ? 'selected' : ''}>Desktop 2026 — glass shell, rail and drawers</option>
+          </select>
+          <div class="form-hint">Classic is the layout from before the desktop refresh: the left setup panel and the right map/network panel both stay open, with nothing tucked away. Desktop 2026 is the glass shell — floating cards on a rail at the left, config flying out of its labels, a wider chat. Narrow the window and either one becomes the same slide-over drawers, so the phone layout is identical whichever you pick. Changing this takes effect at once, no reload.</div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Auto Scroll</span>
+          <div class="toggle ${settings.autoScroll ? 'active' : ''}" id="sbAutoScroll">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Reasoning panels <span class="form-hint-inline" id="sbReasoningPanelHint">${reasoningMode === 'auto' ? 'automatic' : (reasoningMode === 'open' ? 'always open' : 'collapsed')}</span></label>
+          <select class="form-select" id="sbReasoningPanel">
+            <option value="auto" ${reasoningMode === 'auto' ? 'selected' : ''}>Auto — open when the thinking is long (400+ characters)</option>
+            <option value="open" ${reasoningMode === 'open' ? 'selected' : ''}>Always open — every trace in full</option>
+            <option value="closed" ${reasoningMode === 'closed' ? 'selected' : ''}>Always collapsed — keep the transcript flat</option>
+          </select>
+          <div class="form-hint">How each reply's Reasoning panel starts. Opening or closing one by hand is still remembered — that click becomes your choice — and Auto puts the length rule back.</div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Enter to Send</span>
+          <div class="toggle ${settings.enterToSend ? 'active' : ''}" id="sbEnterToSend">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Show Thinking</span>
+          <div class="toggle ${settings.showThinking ? 'active' : ''}" id="sbShowThinking">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Show Terminal</span>
+          <div class="toggle ${settings.showTerminal ? 'active' : ''}" id="sbShowTerminal">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Loading screen</span>
+          <div class="toggle ${Number(settings.loadingScreenMs) > 0 ? 'active' : ''}" id="sbLoadingScreen">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Show Code</span>
+          <div class="toggle ${settings.showCode ? 'active' : ''}" id="sbShowCode">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Read replies aloud <span class="form-hint-inline">auto voice</span></span>
+          <div class="toggle ${settings.autoSpeak ? 'active' : ''}" id="sbAutoSpeak">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-hint" id="sbAutoSpeakHint" style="margin:-6px 0 8px"></div>
+
+        <div class="cfg-sublabel">Chart ghost transcript</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Show chat behind the chart <span class="form-hint-inline">faint, not clickable</span></span>
+          <div class="toggle ${ghost.on ? 'active' : ''}" id="sbGhostOn"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-group" id="sbGhostBody">
+          <label class="form-label">Text colour</label>
+          <input type="color" class="form-input" id="sbGhostColor" value="${esc(ghost.color)}" style="height:32px;padding:2px">
+          <label class="form-label">Text size (px)</label>
+          <input type="number" class="form-input" id="sbGhostSize" value="${ghost.size}" min="7" max="22" step="1">
+          <label class="form-label">Transparency</label>
+          <input type="range" class="form-input" id="sbGhostOpacity" min="0.04" max="0.6" step="0.02" value="${ghost.opacity}">
+          <div class="form-hint" id="sbGhostVal"></div>
+          <div class="form-hint">The conversation printed faintly behind the routing chart's nodes, so you can see what your agents are saying without leaving the chart. Names and times only — no avatars, no scrollbar, nothing clickable. Nodes draw over it.</div>
+        </div>
+      `)}
+
+      ${this._cfgSection('limits', 'Limits & Budgets', { text: `TEMP ${settings.temperature ?? 1.0}` }, `
+        <div class="cfg-sublabel">Model</div>
+        <div class="form-group">
+          <label class="form-label">Temperature</label>
+          <input type="range" class="form-input" id="sbTemp" min="0" max="2" step="0.1" value="${settings.temperature ?? 1.0}">
+          <div class="form-hint" id="sbTempVal">${settings.temperature ?? 1.0}</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Max Tokens</label>
+          <input type="number" class="form-input" id="sbMaxTokens" value="${settings.maxTokens ?? 16384}" min="256" max="131072">
+        </div>
+
+        <div class="cfg-sublabel">Loop cadence</div>
+        <div class="form-group">
+          <label class="form-label">Every tick (seconds)</label>
+          <input type="number" class="form-input" id="sbAlwaysOnInterval" value="${settings.alwaysOnIntervalSec ?? 30}" min="10" max="3600">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Wait after you send (seconds)</label>
+          <input type="number" class="form-input" id="sbAlwaysOnGrace" value="${settings.alwaysOnGraceSec ?? 20}" min="0" max="3600">
+          <div class="form-hint">Quiet period after one of your messages before an autonomous tick may run. Without it a tick that came due while you were typing fired the moment your reply landed, and the agent looked like it had answered you twice. 0 turns it off.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Stop after (iterations)</label>
+          <input type="number" class="form-input" id="sbAlwaysOnMaxIter" value="${settings.alwaysOnMaxIterations ?? 0}" min="0" max="10000">
+          <div class="form-hint">0 = no cap; the agent stops itself when it declares the goal met.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Stop after (minutes)</label>
+          <input type="number" class="form-input" id="sbAlwaysOnMaxMin" value="${settings.alwaysOnMaxMinutes ?? 0}" min="0" max="100000">
+          <div class="form-hint">0 = no cap. Set one if you do not trust a goal to terminate.</div>
+        </div>
+
+        <div class="cfg-sublabel">Shell</div>
+        <div class="form-group">
+          <label class="form-label">Command timeout (seconds)</label>
+          <input type="number" class="form-input" id="sbExecTimeout" min="5" max="600" value="60">
+        </div>
+
+        <div class="cfg-sublabel">Pacing</div>
+        <div class="form-group">
+          <label class="form-label">Requests per minute, per key <span class="form-hint-inline">0 = auto</span></label>
+          <input type="number" class="form-input" id="sbGovRpm" min="0" max="600" value="${settings.rateLimitRpm ?? 0}">
+          <div class="form-hint">0 = auto: each provider paces to its free-tier default from the harness table — NVIDIA NIM 40, Groq 30, OpenRouter 20, local runners unpaced. Any number here overrides every provider with a fixed ceiling.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Longest single wait (seconds)</label>
+          <input type="number" class="form-input" id="sbGovMaxWait" min="5" max="600" value="${Math.round((settings.rateLimitMaxWaitMs ?? 65000) / 1000)}">
+          <div class="form-hint">Past this the call goes out anyway and the retry path takes over. A wait that long means the key is saturated.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Token budget, per key <span class="form-hint-inline">0 = off</span></label>
+          <input type="number" class="form-input" id="sbTokenBudget" min="0" max="1000000000" step="1000" value="${settings.tokenBudget ?? 0}">
+          <div class="form-hint">What this key's plan allows (e.g. 8000000). Agent cards then show spent / budget, with a percentage. 0 leaves them at raw totals. A per-agent value can override it in Brain Lab.</div>
+        </div>
+      `)}
+
+      ${this._cfgSection('tls', 'TLS / Certificates', { text: settings.tlsOff ? 'OFF' : '' }, `
+        <div class="form-group">
+          <label class="form-label">Certificate checks on model and speech calls</label>
+          <select class="form-input" id="sbTlsVerify">
+            <option value="auto">Auto &mdash; verify public hosts, skip LAN and loopback</option>
+            <option value="on">Always verify, LAN included</option>
+            <option value="off">Never verify (any certificate, no hostname check)</option>
+          </select>
+          <div class="form-hint">The server makes these calls, so this is stored in <code>storage/config.json</code> under <code>tls.verify</code>, not in the browser. <b>Auto</b> verifies real providers (OpenAI, Anthropic, OpenRouter, Google) and skips the check for loopback, LAN addresses and single-word host names &mdash; where a self-signed certificate normally lives. Plain <code>http://</code> endpoints (LM Studio, Ollama) have no certificate at all, so they work whatever this says. <b>Never verify</b> accepts any certificate and stops checking the hostname, which means the API key and the prompt go to whoever answers.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">CA bundle <span class="form-hint-inline">optional</span></label>
+          <input type="text" class="form-input" id="sbTlsCa" placeholder="/etc/ssl/certs/my-lan-ca.pem" autocomplete="off" spellcheck="false">
+          <div class="form-hint">A PEM file trusted in addition to the system store &mdash; the way to make a self-signed LAN host verify properly instead of turning the checks off. Saved as <code>tls.ca_bundle</code>; a path the server cannot read is ignored.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Pin the certificate a host presents <span class="form-hint-inline">no openssl needed</span></label>
+          <input type="text" class="form-input" id="sbTlsHost" placeholder="https://192.168.1.50:1234" autocomplete="off" spellcheck="false">
+          <div class="form-hint">Reads the certificate an https endpoint actually presents, shows whose it is and its SHA-256 fingerprint, and on PIN writes it to <code>storage/tls/trusted.pem</code> &mdash; which Auto and Always verify then check against. That is how a self-signed LAN host gets verified instead of skipped, with nothing generated by hand. The read is unverified by necessity, so compare the fingerprint with what the server reports before trusting it.</div>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <button class="btn btn-secondary btn-sm" id="sbTlsCheck">CHECK CERTIFICATE</button>
+            <button class="btn btn-primary btn-sm" id="sbTlsPin">PIN</button>
+          </div>
+          <div class="form-hint" id="sbTlsCertStatus"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Pinned certificates <span class="form-hint-inline" id="sbTlsPinCount"></span></label>
+          <div id="sbTlsPins"><div class="form-hint">Reading pinned certificates...</div></div>
+          <div class="form-hint">Everything in <code>storage/tls/trusted.pem</code> is trusted by Auto and Always verify. FORGET rewrites the bundle without that certificate, so the trust stops at once; pinning the host again restores it.</div>
+        </div>
+        <div class="form-hint" id="sbTlsStatus"></div>
+      `)}
+
+      ${this._cfgSection('perm', 'Permissions', settings.autoDeny
+        ? { text: 'AUTO DENY', cls: 'danger' }
+        : (mem === 0 ? { text: 'MEMORY OFF', cls: 'warn' } : { text: '' }), `
+        <div class="form-group">
+          <label class="form-label">Memory (past messages)</label>
+          <input type="number" class="form-input" id="sbHistoryTurns" value="${mem}" min="0" max="50">
+          <div class="form-hint">How many of your earlier messages each agent is shown before your new one, plus the replies that followed (so 5 = up to 10 messages). 0 = every message treated as the first (no memory).</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Working Project Directory</label>
+          <input type="text" class="form-input" id="sbProjectDir" placeholder="/var/www/site/myproject" autocomplete="off" spellcheck="false">
+          <div class="form-hint">The one folder every agent works in. They may read and write inside it, and nothing outside it. Full path on the server (<code>/var/www/site</code> or <code>C:\site</code>). Empty turns the file tools off; web search is unaffected.</div>
+          <div class="form-hint" id="sbProjectStatus"></div>
+          <div class="form-hint" id="sbBindStatus"></div>
+          <div style="display:flex;gap:6px;margin-top:6px">
+            <button class="btn btn-secondary btn-sm" id="sbBindRetry">BIND FILE TOOLS</button>
+          </div>
+        </div>
+
+        <div class="cfg-sublabel">Always-On Agents <span class="form-hint-inline">work on their own</span></div>
+        <div class="toggle-row">
+          <span class="toggle-label">Enable always-on</span>
+          <div class="toggle ${settings.alwaysOn ? 'active' : ''}" id="sbAlwaysOn">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-hint">Agents you have given a standing goal re-prompt themselves on a timer. Everything they do lands in this chat. Each iteration is billed, so leave the interval generous. Cadence is under Limits &amp; Budgets.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Run while tab is hidden</span>
+          <div class="toggle ${settings.alwaysOnRunHidden ? 'active' : ''}" id="sbAlwaysOnHidden">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-hint" id="sbAlwaysOnStatus"></div>
+        <button class="btn btn-ghost btn-block" id="sbAlwaysOnRelease" style="margin-top:8px;display:none">RELEASE HELD AGENTS</button>
+
+        <div class="cfg-sublabel">Approvals</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Auto Approve <span class="form-hint-inline">no prompt before a write</span></span>
+          <div class="toggle ${settings.autoApprove ? 'active' : ''}" id="sbAutoApprove">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-hint" id="sbAutoApproveHint" style="margin:-6px 0 8px"></div>
+        <div class="toggle-row">
+          <span class="toggle-label">Auto Deny <span class="form-hint-inline">refuse anything that would ask</span></span>
+          <div class="toggle ${settings.autoDeny ? 'active' : ''}" id="sbAutoDeny">
+            <div class="toggle-knob"></div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Per-tool approval</label>
+          ${[
+            ['exec', 'Shell commands'],
+            ['window_open', 'Opening programs'],
+            ['window_type', 'Typing into programs'],
+            ['window_close', 'Closing programs'],
+            ['write_file', 'File writes'],
+            ['write_note', 'Notes'],
+            ['remember', 'Private memory'],
+          ].map(([t, label]) => `
+          <div class="toggle-row">
+            <span class="toggle-label">${label}</span>
+            <select class="form-select" id="sbToolPolicy-${t}" style="max-width:130px">
+              ${['allow', 'ask', 'deny'].map(m =>
+                `<option value="${m}"${(settings.toolPolicy?.[t] || 'ask') === m ? ' selected' : ''}>${m[0].toUpperCase() + m.slice(1)}</option>`).join('')}
+            </select>
+          </div>`).join('')}
+          <div class="form-hint">Allow runs it, Ask prompts (skipped while Auto
+            Approve is on), Deny refuses. Auto Deny above refuses all of them.</div>
+        </div>
+
+        <div class="cfg-sublabel">Shell access <span class="form-hint-inline">agents running real commands</span></div>
+        <div id="sbExecBlock" style="margin-top:6px">
+          <div class="toggle-row">
+            <span class="toggle-label">Allow agents to run commands</span>
+            <div class="toggle" id="sbExecOn"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="form-hint">Runs on this server as the web user, jailed to the directories above. Off by default; on your copy only. Its timeout is under Limits &amp; Budgets.</div>
+          <div class="toggle-row" id="sbExecApprovalRow" style="margin-top:6px">
+            <span class="toggle-label">Ask before running a new command</span>
+            <div class="toggle" id="sbExecApproval"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="form-hint">New commands pop up for approval wherever you are. Anything still waiting is counted below — open it to review.</div>
+          <div class="form-hint" id="sbExecStatus"></div>
+        </div>
+
+        <div class="cfg-sublabel">Code interpreter <span class="form-hint-inline">run whole snippets</span></div>
+        <div class="toggle-row">
+          <span class="toggle-label">Allow the run_code tool</span>
+          <div class="toggle" id="sbCodeOn"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Runs a Python/Node/bash snippet in the sandbox working directory as the web user. Stronger than the command allowlist, so it is off by default and separate from shell access. The agent asks before each run.</div>
+
+        <div class="cfg-sublabel">Programs <span class="form-hint-inline">open real apps on this machine</span></div>
+        <div id="sbProgBlock" style="margin-top:6px">
+          <div class="toggle-row">
+            <span class="toggle-label">Allow agents to open programs</span>
+            <div class="toggle" id="sbProgOn"><div class="toggle-knob"></div></div>
+          </div>
+          <div class="form-hint">Opens a real window on the machine this server runs on — detached, so it stays
+            open after the agent's reply, and nothing waits on it. An agent may only <b>name</b> a program
+            from the list below; it can never supply a path or a command line. Off by default, your copy only.</div>
+          <div id="sbProgList" style="margin-top:8px"></div>
+          <button class="btn btn-ghost btn-block" id="sbProgAdd" style="margin-top:8px">+ ADD PROGRAM</button>
+          <button class="btn btn-primary btn-block" id="sbProgSave" style="margin-top:8px">VERIFY &amp; SAVE</button>
+          <div class="form-hint" id="sbProgStatus"></div>
+          <div class="form-hint" id="sbProgNote"></div>
+        </div>
+
+        <button class="btn btn-ghost btn-block" id="sbPolicyBtn" style="margin-top:12px">ALLOW / DENY LIST</button>
+        <div class="form-hint" id="sbPolicyHint" style="margin:4px 0 0"></div>
+      `)}
+
+      ${this._cfgSection('labs', 'Labs', settings.dynamicTools !== false
+        ? { text: 'ON', cls: 'ok' } : { text: 'OFF' }, `
+        <div class="toggle-row">
+          <span class="toggle-label">Dynamic tools <span class="form-hint-inline">adapt to the model &amp; server</span></span>
+          <div class="toggle ${settings.dynamicTools !== false ? 'active' : ''}" id="sbDynTools"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Tells each model the environment it is really in — the server's OS, working directory and which shell commands actually exist — and gives one correct example per tool in that model's own dialect. This is what stops free/quantised models burning steps guessing the syntax. Off restores the classic fixed instructions.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Remember the working dialect</span>
+          <div class="toggle ${settings.toolDialectMemo !== false ? 'active' : ''}" id="sbDialectMemo"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Once a model's tool call parses, remember which dialect worked for that provider + model and start there next time. Off re-derives it every turn.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">API pool <span class="form-hint-inline">rotate extra provider keys</span></span>
+          <div class="toggle ${settings.apiPool ? 'active' : ''}" id="sbApiPool"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">When on, a provider's pool of extra keys (Provider editor → API pool) is used, rotating after the number of requests you set; a key that 429s is rested. Off = the single provider key, exactly as before.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Browser <span class="form-hint-inline">a real Chrome/Edge you watch</span></span>
+          <div class="toggle" id="sbBrowser"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Drives an installed Chrome or Edge over the DevTools Protocol — no packages. Off by default. Agents reach it with the <code>browser_*</code> tools; you can watch the window and take over, and the login profile persists. (Stored server-side; needs Chrome or Edge installed.)</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Keep Live running when hidden <span class="form-hint-inline">browser screen</span></span>
+          <div class="toggle ${settings.browserLiveBackground !== false ? 'active' : ''}" id="sbLiveBg"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">On: the Browser's Live view keeps refreshing while you are on other screens, so it is never stale when you return. Off: Live pauses when you leave the Browser screen and resumes when you come back. Either way the Live on/off choice itself is remembered.</div>
+        <div class="form-hint" id="sbLabsStatus"></div>
+      `)}
+
+      ${this._cfgSection('resources', 'Resource Manager', { text: '' }, `
+        <div class="form-hint">Keep the machine cool. Everything here is <b>off by default</b> — the 3D graph renders continuously, exactly as it always has. Turn a switch on to let the app rest when it is not needed, and watch the gauges.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Pause when a panel is open <span class="form-hint-inline">routing chart · labs · browser</span></span>
+          <div class="toggle ${rm.pauseCovered ? 'active' : ''}" id="sbRmCovered"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Pause when the window isn't focused</span>
+          <div class="toggle ${rm.pauseUnfocused ? 'active' : ''}" id="sbRmUnfocused"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Pause when the graph is off-screen</span>
+          <div class="toggle ${rm.pauseOffscreen ? 'active' : ''}" id="sbRmOffscreen"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Slow down when idle</span>
+          <div class="toggle ${rm.idleThrottle ? 'active' : ''}" id="sbRmIdle"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="toggle-row">
+          <span class="toggle-label">Idle frame rate <span class="form-hint-inline">fps</span></span>
+          <input type="number" class="form-input" id="sbRmIdleFps" min="1" max="60" value="${rm.idleFps ?? 10}" style="max-width:84px">
+        </div>
+        <div class="rm-gauges">
+          ${this._dial('Cpu', 'CPU', 'app JS share of each frame')}
+          ${this._dial('Gpu', 'GPU', 'render time per frame')}
+        </div>
+        <div class="form-hint" id="sbRmReadout">&nbsp;</div>
+      `)}
+
+      ${this._cfgSection('throttle', 'Throttle / Limiter', {
+        text: settings.rateLimitEnabled !== false ? `ON · ${rpm ? rpm + '/min' : 'AUTO'}` : 'OFF',
+        cls: settings.rateLimitEnabled !== false ? 'ok' : '',
+      }, `
+        <div class="toggle-row">
+          <span class="toggle-label">Pace model calls</span>
+          <div class="toggle ${settings.rateLimitEnabled !== false ? 'active' : ''}" id="sbGovOn"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Counts requests per API key over a rolling minute. Over budget, calls queue and wait instead of spending a 429 refusal. Each key is its own bucket — your separate accounts do not share. The two numbers it uses are under Limits &amp; Budgets.</div>
+        <div class="toggle-row" style="margin-top:6px">
+          <span class="toggle-label">Stealth waits <span class="form-hint-inline">no toast while queuing</span></span>
+          <div class="toggle ${settings.rateLimitStealth !== false ? 'active' : ''}" id="sbGovStealth"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="toggle-row" style="margin-top:6px">
+          <span class="toggle-label">Tell agents their budget <span class="form-hint-inline">off by default</span></span>
+          <div class="toggle ${settings.budgetInjection === true ? 'active' : ''}" id="sbGovInject"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Adds a short budget line to the system prompt, but only once a key is half spent. Costs tokens on those turns, and models are unreliable at throttling themselves — the limiter works whether they know or not.</div>
+        <div class="form-hint" id="sbGovStatus"></div>
+      `)}
+
+      ${this._cfgSection('mcp', 'MCP Client', { text: `${(this._mcpServers || []).length || ''}` }, `
+        <div class="form-hint">Connect OUT to other MCP servers. Each gives your agents extra tools (filesystem, git, fetch, a company API…). Agents call them with <code>mcp_list</code> / <code>mcp_call</code>. To let someone else use <b>your</b> tools, see the MCP Server section.</div>
+        <div id="sbMcpList"></div>
+        <button class="btn btn-ghost btn-block" id="sbMcpAdd" style="margin-top:8px">+ ADD SERVER</button>
+        <div class="form-hint">Values under <code>env</code> and <code>headers</code> are stored on the server and read back masked — a row of dots means a value is saved and will be kept. Type over it to replace it.</div>
+        <button class="btn btn-primary btn-block" id="sbMcpSave" style="margin-top:8px">SAVE MCP CLIENT</button>
+        <div class="form-hint" id="sbMcpStatus"></div>
+      `)}
+
+      ${this._cfgSection('mcpserver', 'MCP Server', { text: this._mcpSrv?.enabled ? 'ON' : '', cls: this._mcpSrv?.enabled ? 'ok' : '' }, `
+        <div class="form-hint">Let someone else's MCP client — a friend's local model, Claude Desktop, Cursor — use tools on THIS machine. Each friend gets their own token and scope. A token is shown once, when it is created or rotated; after that only ROTATE can hand you a new one. Nothing here is permanent; it is all your switch.</div>
+        <div class="toggle-row">
+          <span class="toggle-label">Enable the MCP server</span>
+          <div class="toggle ${this._mcpSrv?.enabled ? 'active' : ''}" id="sbMcpSrvOn"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Scratch folder friends work in</label>
+          <input class="form-input" id="sbMcpSrvRoot" value="${escAttr(this._mcpSrv?.root || '')}" placeholder="e.g. /var/www/site/friends">
+          <div class="form-hint">Their file tools and command working directory are jailed here, and a deny-all .htaccess is dropped in so nothing they write is served over the web.</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">Protected paths <span class="form-hint-inline">refused even inside the root</span></label>
+          <textarea class="form-textarea" id="sbMcpSrvProtect" rows="3" placeholder="one rule per line">${esc((this._mcpSrv?.protect || []).join('\n'))}</textarea>
+          <div class="form-hint">Secrets the file tools always refuse (default: storage, keys, dotfiles). Clear it entirely to turn protection off.</div>
+        </div>
+        <div class="form-label">Friend tokens</div>
+        <div id="sbMcpSrvTokens"></div>
+        <button class="btn btn-ghost btn-block" id="sbMcpSrvAdd" style="margin-top:8px">+ ADD FRIEND</button>
+        <button class="btn btn-primary btn-block" id="sbMcpSrvSave" style="margin-top:8px">SAVE MCP SERVER</button>
+        <div class="form-hint" id="sbMcpSrvStatus"></div>
+      `)}
+
+      ${this._cfgSection('updates', 'Updates', (this._installPre?.pending || []).length
+        ? { text: 'UNFINISHED', cls: 'danger' }
+        : this._updatePlan
+          ? { text: `PUBLISHED v${esc(this._updatePlan.targetVersion?.label || '?')}`, cls: 'warn' }
+          : { text: '' }, `
+        <div class="form-hint">Fetches the published release into <code>storage/updates/</code>,
+          checks the archive, and lists what is different. <b>Downloading replaces nothing.</b>
+          INSTALL then copies the new files over the app's own — after writing a rollback copy to
+          <code>storage/backups/</code> first. Nothing under <code>storage/</code> is ever written, so
+          sessions, agents, models and keys stay exactly as they are.</div>
+        <div id="sbUpdatePending"></div>
+        <div class="toggle-row">
+          <span class="toggle-label">Check for updates when the app loads</span>
+          <div class="toggle ${settings.checkUpdatesOnStartup === false ? '' : 'active'}" id="sbUpdateAuto"><div class="toggle-knob"></div></div>
+        </div>
+        <div class="form-hint">Reads one small file from the published copy and compares version
+          numbers — never the archive, so it cannot cost a download at startup. The server remembers
+          the answer for six hours. Off: the bell stays quiet, and CHECK NOW still works.</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          <button class="btn btn-ghost" id="sbUpdateNow" style="white-space:nowrap">CHECK NOW</button>
+          <div class="form-hint" id="sbUpdateSeen" style="flex:1;margin:0"></div>
+        </div>
+        <div class="change-notes-host" id="sbUpdateChange"></div>
+        <button class="btn btn-ghost btn-block" id="sbUpdateCheck" style="margin-top:8px">DOWNLOAD UPDATE…</button>
+        <div class="form-hint" id="sbUpdateStatus"></div>
+        <div id="sbUpdatePlan"></div>
+        <button class="btn btn-primary btn-block" id="sbUpdateInstall" style="margin-top:8px;display:none">INSTALL UPDATE</button>
+        <div class="form-hint" id="sbUpdateInstallHint"></div>
+        <div id="sbUpdateRollback" style="margin-top:8px"></div>
+      `)}
+
+      <div class="cfg-cluster">
+        <div class="form-group" style="margin-top:0">
+          <label class="form-label">Access token</label>
+          <div style="display:flex;gap:6px">
+            <input type="password" class="form-input" id="sbRouterToken" style="flex:1;min-width:0"
+              value="${settings.routerToken ? esc(settings.routerToken) : ''}"
+              placeholder="paste the token from storage/config.json" autocomplete="off">
+            <button class="btn btn-ghost" id="sbTokenShow" title="Show the token to check the paste">Show</button>
+            <button class="btn btn-primary" id="sbTokenSave" title="Save the token now">Save</button>
+          </div>
+          <div class="form-hint" id="sbTokenStatus"></div>
+          <div class="form-hint">Required while <code>require_token</code> is on. Every API call sends this in
+            the <code>X-Router-Token</code> header, and without it every endpoint answers 401.</div>
+        </div>
+        <button class="btn btn-ghost btn-block" id="sbUsageBtn" style="margin-top:8px">USAGE</button>
+        <button class="btn btn-ghost btn-block" id="sbTraceBtn" style="margin-top:8px">TRACE</button>
+        <button class="btn btn-ghost btn-block" id="sbDiagBtn" style="margin-top:8px">DIAGNOSE PROVIDERS</button>
+        <div class="form-hint" id="sbDiagHint" style="margin:4px 0 0"></div>
+        <div id="sbDiagOut"></div>
+        <button class="btn btn-ghost btn-block" id="sbExportBtn" style="margin-top:8px">EXPORT SESSION</button>
+        <button class="btn btn-ghost btn-block" id="sbBackupBtn" style="margin-top:8px">FULL BACKUP</button>
+        <button class="btn btn-ghost btn-block" id="sbRestoreBtn" style="margin-top:8px">RESTORE BACKUP…</button>
+        <div class="form-hint">A backup downloads straight to your device, so it can
+          move between copies freely — the restore keeps this copy's own access
+          token, gate and roots. Choose the file name and which parts to include
+          (agents, providers &amp; keys, models, settings, notes, sessions…);
+          restoring offers the same choice, and parts the file does not carry
+          are left alone. <b>Backups hold API keys and the access token</b> —
+          keep the file somewhere safe, never post it.</div>
+        <input type="file" id="sbRestoreFile" accept=".json,application/json" hidden>
+        <button class="btn btn-ghost btn-block cfg-danger" id="sbResetBtn" style="margin-top:8px">RESET ALL</button>
+      </div>
+
+      <div class="cfg-savebar">
+        <div class="cfg-savebar-hint" id="cfgSaveHint">Switches apply instantly · numbers save here</div>
+        <button class="btn btn-primary btn-block" id="sbSaveBtn">SAVE</button>
+      </div>
+    `;
+
+    // Open/close bookkeeping, in memory for this session only. The `toggle`
+    // event does not bubble, but it is attached per element here, so each
+    // <details> reports its own state and it is remembered for the next
+    // render within the session (a reload starts from an empty set, so every
+    // section is collapsed again).
+    this.bodyEl.querySelectorAll('details.cfg-section').forEach(det => {
+      det.addEventListener('toggle', () => {
+        const id = det.dataset.cfgSection;
+        if (det.open) this._cfgOpen.add(id);
+        else this._cfgOpen.delete(id);
+      });
+    });
+
+    // A pending number marks its section so the header can show it. Only the
+    // fields that genuinely wait for SAVE are marked: Theme, the per-tool
+    // selects, the shell timeout and Memory all persist the moment they
+    // change, so a dot on those would appear and never clear. The save itself
+    // still happens on SAVE -- this is only the "you changed something" signal.
+    [
+      'sbTemp', 'sbMaxTokens',
+      'sbAlwaysOnInterval', 'sbAlwaysOnGrace', 'sbAlwaysOnMaxIter', 'sbAlwaysOnMaxMin',
+      'sbGovRpm', 'sbGovMaxWait', 'sbTokenBudget', 'sbProjectDir',
+    ].forEach(id => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      const mark = () => el.closest('details.cfg-section')?.classList.add('dirty');
+      el.addEventListener('input', mark);
+      el.addEventListener('change', mark);
+    });
+
+    // Theme change
+    document.getElementById('sbTheme').addEventListener('change', (e) => {
+      store.emit('theme:change', e.target.value);
+    });
+
+    // Interface: Classic (default, both panels) or the Desktop 2026 glass
+    // shell. Applies immediately -- desktop2026.js listens for the event -- and
+    // is written through at once, so the choice survives a reload even if SAVE
+    // is never pressed. Every feature stays in both shells; only the glass
+    // goes away.
+    document.getElementById('sbIface')?.addEventListener('change', (e) => {
+      const mode = normalizeIface(e.target.value);
+      store.set('settings.interfaceMode', mode);
+      try { persistence.set('settings', store.get('settings')); } catch { /* view pref only */ }
+      store.emit(IFACE_EVENT, mode);
+      store.emit('toast', {
+        message: mode === 'desktop'
+          ? 'Desktop 2026 interface on — glass shell, rail and drawers'
+          : 'Classic interface on — both panels side by side',
+        type: 'info',
+      });
+    });
+
+    // Temperature
+    const tempSlider = document.getElementById('sbTemp');
+    const tempVal = document.getElementById('sbTempVal');
+    tempSlider.addEventListener('input', (e) => {
+      tempVal.textContent = e.target.value;
+      store.set('settings.temperature', parseFloat(e.target.value));
+      localStorage.setItem(K.TEMP, e.target.value);
+    });
+
+    // Max tokens
+    document.getElementById('sbMaxTokens').addEventListener('change', (e) => {
+      store.set('settings.maxTokens', parseInt(e.target.value, 10));
+      localStorage.setItem(K.MAX_TOKENS, e.target.value);
+    });
+
+    // Memory depth
+    document.getElementById('sbHistoryTurns')?.addEventListener('change', (e) => {
+      const n = Math.max(0, Math.min(50, parseInt(e.target.value, 10) || 0));
+      store.set('settings.historyTurns', n);
+      try { localStorage.setItem(K.HISTORY_TURNS, String(n)); } catch {}
+    });
+
+    // Working project directory — fetch the current value so the field shows
+    // what the server is actually using, not a stale local copy.
+    this._loadProjectDir();
+    this._loadBindState();
+    document.getElementById('sbBindRetry')?.addEventListener('click', () => this._rebindFileTools());
+
+    // MCP servers live server-side (config.json); render the cached list and
+    // refresh from the server in the background.
+    this._initMcpSection();
+    // MCP *server* config (friends connect in) — also server-side.
+    this._initMcpServerSection();
+
+    // Shell access lives server-side (config.json), because that is where the
+    // gate is enforced — a browser-side flag would be a lie the server ignores.
+    this._loadExecSettings();
+
+    // Toggles
+    this._initToggle('sbAutoSpeak', (val) => {
+      store.set('settings.autoSpeak', val);
+      persistence.set('settings', store.get('settings'));
+      const hint = document.getElementById('sbAutoSpeakHint');
+      if (hint) {
+        hint.textContent = val
+          ? 'Every agent reply is read. Individual agents can be muted in their own settings.'
+          : 'Off. Replies are only read when you click the speaker.';
+      }
+    });
+    {
+      const hint = document.getElementById('sbAutoSpeakHint');
+      if (hint) {
+        hint.textContent = settings.autoSpeak
+          ? 'Every agent reply is read. Individual agents can be muted in their own settings.'
+          : 'Off. Replies are only read when you click the speaker.';
+      }
+    }
+
+    // Allow / deny editor
+    // Saved on input rather than on SAVE. If the token is wrong the app cannot
+    // reach the API, and the SAVE button is an API call -- so requiring a save
+    // first would lock you out with no way to correct it.
+    // Read the field ON DEMAND rather than trusting blur/change alone: on
+    // mobile the change event is unreliable (re-renders and keyboard
+    // behaviour can swallow the blur), which silently dropped pastes.
+    const saveTokenFromField = () => {
+      const field = document.getElementById('sbRouterToken');
+      if (!field) return;
+      const v = field.value.trim();
+      store.set('settings.routerToken', v);
+      persistence.set('settings', store.get('settings'));
+      const status = document.getElementById('sbTokenStatus');
+      if (!v) {
+        if (status) status.textContent = '';
+        store.emit('toast', { message: 'Access token cleared', type: 'info' });
+        return;
+      }
+      // Verify live, right here: a masked field gives no way to eyeball the
+      // paste, so the app says immediately whether the server accepts it.
+      // api.getState is a side-effect-free read; a 401 rejects the promise.
+      if (status) status.textContent = 'Checking token…';
+      api.getState().then(
+        () => {
+          const s = document.getElementById('sbTokenStatus');
+          if (s) s.textContent = 'Token works ✓';
+        },
+        () => {
+          const s = document.getElementById('sbTokenStatus');
+          if (s) s.textContent = 'Token rejected ✗ — re-copy it carefully and paste again.';
+        }
+      );
+      store.emit('toast', { message: 'Access token saved', type: 'success' });
+    };
+    const tokenInput = document.getElementById('sbRouterToken');
+    tokenInput?.addEventListener('change', saveTokenFromField);
+    document.getElementById('sbTokenSave')?.addEventListener('click', saveTokenFromField);
+    // Let the paste be eyeballed: masked dots hide a truncated copy, which is
+    // the usual way a 64-char token fails on a phone.
+    document.getElementById('sbTokenShow')?.addEventListener('click', () => {
+      const inp = document.getElementById('sbRouterToken');
+      const btn = document.getElementById('sbTokenShow');
+      if (!inp) return;
+      const show = inp.type === 'password';
+      inp.type = show ? 'text' : 'password';
+      if (btn) btn.textContent = show ? 'Hide' : 'Show';
+    });
+
+    document.getElementById('sbPolicyBtn')?.addEventListener('click', () => this.openPolicyEditor());
+    this._loadPolicyHint();
+
+    // Labs: dynamic tools + dialect memo. Both read live from settings, so a
+    // change takes effect on the next turn with no SAVE.
+    this._initToggle('sbDynTools', (val) => store.set('settings.dynamicTools', val));
+    this._initToggle('sbDialectMemo', (val) => store.set('settings.toolDialectMemo', val));
+    this._initToggle('sbApiPool', (val) => store.set('settings.apiPool', val));
+    this._initToggle('sbLiveBg', (val) => store.set('settings.browserLiveBackground', val));
+    this._initBrowserToggle();
+    this._loadLabsStatus();
+    this._initUpdates();
+
+    // Resource Manager: every switch defaults off; turning one on lets the
+    // 3D graph rest. The gauges read live values from ui/js/perf.js.
+    this._initToggle('sbRmCovered', (val) => store.set('settings.resourceManager.pauseCovered', val));
+    this._initToggle('sbRmUnfocused', (val) => store.set('settings.resourceManager.pauseUnfocused', val));
+    this._initToggle('sbRmOffscreen', (val) => store.set('settings.resourceManager.pauseOffscreen', val));
+    this._initToggle('sbRmIdle', (val) => store.set('settings.resourceManager.idleThrottle', val));
+    const rmFps = document.getElementById('sbRmIdleFps');
+    rmFps?.addEventListener('change', () => {
+      const n = Math.max(1, Math.min(60, parseInt(rmFps.value, 10) || 10));
+      rmFps.value = n;
+      store.set('settings.resourceManager.idleFps', n);
+      persistence.set('settings', store.get('settings'));
+    });
+    this._startGauges();
+
+    // Reasoning panels: Auto keeps the length rule, open/collapsed pin every
+    // message. Written at once like the other display preferences, so the next
+    // reply obeys it without a SAVE.
+    document.getElementById('sbReasoningPanel')?.addEventListener('change', (e) => {
+      const mode = e.target.value;
+      store.set('settings.reasoningOpen', mode === 'open' ? true : (mode === 'closed' ? false : 'auto'));
+      try { persistence.set('settings', store.get('settings')); } catch { /* view pref only */ }
+      store.emit('toast', {
+        message: mode === 'auto'
+          ? 'Reasoning panels follow the length again — 400 characters or more opens'
+          : (mode === 'open' ? 'Reasoning panels now start open' : 'Reasoning panels now start collapsed'),
+        type: 'info',
+      });
+    });
+
+    // A panel toggled by hand writes the same setting, so follow the store
+    // rather than the click: this section is rebuilt on every open, and the
+    // previous listener is dropped first so they cannot pile up.
+    const paintReasoningMode = (val) => {
+      const select = document.getElementById('sbReasoningPanel');
+      if (!select) return;
+      const mode = val === true ? 'open' : (val === false ? 'closed' : 'auto');
+      if (select.value !== mode) select.value = mode;
+      const hint = document.getElementById('sbReasoningPanelHint');
+      if (hint) {
+        hint.textContent = mode === 'auto' ? 'automatic' : (mode === 'open' ? 'always open' : 'collapsed');
+      }
+    };
+    if (this._reasoningSub) this._reasoningSub();
+    this._reasoningSub = store.subscribe('settings.reasoningOpen', paintReasoningMode);
+
+    this._initToggle('sbAutoScroll', (val) => store.set('settings.autoScroll', val));
+    this._initToggle('sbEnterToSend', (val) => store.set('settings.enterToSend', val));
+    // Applied to the panels immediately, not just saved: without this the
+    // switch visibly did nothing until the next reload, which reads as broken.
+    this._initToggle('sbShowThinking', (val) => {
+      store.set('settings.showThinking', val);
+      document.getElementById('thinkingPanel')?.classList.toggle('hidden', !val);
+    });
+    this._initToggle('sbShowTerminal', (val) => {
+      store.set('settings.showTerminal', val);
+      document.getElementById('terminalPanel')?.classList.toggle('hidden', !val);
+    });
+    // Off means zero milliseconds, not "some shorter time" -- the splash either
+    // exists or it does not. Default (absent) is off.
+    this._initToggle('sbLoadingScreen', (val) => {
+      store.set('settings.loadingScreenMs', val ? 12200 : 0);
+      store.emit('toast', {
+        message: val
+          ? 'Loading screen on — it applies on your next reload.'
+          : 'Loading screen off — it applies on your next reload.',
+        type: 'info',
+      });
+    });
+    this._initToggle('sbShowCode', (val) => store.set('settings.showCode', val));
+
+// Ghost transcript: applies the moment it is changed, like every other
+// display switch here. There is no SAVE to wait for and nothing to persist
+// beyond the settings blob, which _initToggle already does.
+    const ghostBody = document.getElementById('sbGhostBody');
+    const ghostVal = document.getElementById('sbGhostVal');
+    const paintGhostBody = () => { if (ghostBody) ghostBody.style.opacity = ghost.on ? '1' : '0.45'; };
+    const ghostLabel = () => {
+      if (!ghostVal) return;
+      ghostVal.textContent = ghost.on
+        ? `on · ${ghost.color} · ${ghost.size}px · ${Math.round(ghost.opacity * 100)}% visible`
+        : 'off — the chart canvas is clear';
+    };
+    const setGhost = (patch) => {
+      store.set('settings.chartGhost', { ...(store.get('settings.chartGhost') || ghost), ...patch });
+      Object.assign(ghost, store.get('settings.chartGhost'));
+      paintGhostBody();
+      ghostLabel();
+    };
+    this._initToggle('sbGhostOn', (val) => setGhost({ on: val }));
+    document.getElementById('sbGhostColor')?.addEventListener('input', (e) => setGhost({ color: e.target.value }));
+    document.getElementById('sbGhostSize')?.addEventListener('change', (e) => {
+      const n = Math.max(7, Math.min(22, parseInt(e.target.value, 10) || 11));
+      e.target.value = String(n);
+      setGhost({ size: n });
+    });
+    document.getElementById('sbGhostOpacity')?.addEventListener('input', (e) => {
+      setGhost({ opacity: Math.max(0.04, Math.min(0.6, parseFloat(e.target.value) || 0.3)) });
+    });
+    paintGhostBody();
+    ghostLabel();
+
+    // Auto Deny is the panic button: anything that would ask is refused.
+    this._initToggle('sbAutoDeny', (val) => store.set('settings.autoDeny', val));
+    // Per-tool allow/ask/deny. Persisted like every other setting, so it
+    // syncs; the running loop reads it live on each call.
+    for (const t of ['exec', 'window_open', 'window_type', 'window_close', 'write_file', 'write_note', 'remember']) {
+      document.getElementById('sbToolPolicy-' + t)?.addEventListener('change', (e) => {
+        const settings = store.get('settings') || {};
+        const policy = { ...(settings.toolPolicy || {}) };
+        policy[t] = e.target.value;
+        store.set('settings.toolPolicy', policy);
+        persistence.set('settings', store.get('settings'));
+      });
+    }
+    // Auto Approve changes what a click means, so say what it turned off.
+    this._initToggle('sbAutoApprove', (val) => {
+      store.set('settings.autoApprove', val);
+      const hint = document.getElementById('sbAutoApproveHint');
+      if (hint) {
+        hint.textContent = val
+          ? 'Agents can write files and notes without asking you first.'
+          : '';
+      }
+      if (val) {
+        store.emit('toast', {
+          message: 'Auto approve on — writes will not ask', type: 'info',
+        });
+      }
+    });
+    if (settings.autoApprove) {
+      const hint = document.getElementById('sbAutoApproveHint');
+      if (hint) hint.textContent = 'Agents can write files and notes without asking you first.';
+    }
+
+    // Always-on: the master switch starts and stops the scheduler immediately,
+    // so flipping it takes effect without waiting for the SAVE button.
+    this._initToggle('sbAlwaysOn', (val) => {
+      store.set('settings.alwaysOn', val);
+      persistence.set('settings', store.get('settings'));
+      store.emit('settings:changed');
+      this._renderAlwaysOnStatus();
+    });
+    this._initToggle('sbAlwaysOnHidden', (val) => {
+      store.set('settings.alwaysOnRunHidden', val);
+      persistence.set('settings', store.get('settings'));
+    });
+    document.getElementById('sbAlwaysOnRelease')?.addEventListener('click', () => {
+      store.emit('alwaysOn:releaseAll');
+    });
+    this._renderAlwaysOnStatus();
+
+    // Rate governor: master switch + stealth + injection apply immediately,
+    // the numbers land on SAVE like every other field in this tab.
+    this._initToggle('sbGovOn', (val) => {
+      store.set('settings.rateLimitEnabled', val);
+      store.emit('settings:changed');
+      this._renderGovStatus();
+    });
+    this._initToggle('sbGovStealth', (val) => {
+      store.set('settings.rateLimitStealth', val);
+    });
+    this._initToggle('sbGovInject', (val) => {
+      store.set('settings.budgetInjection', val);
+      if (val) {
+        store.emit('toast', {
+          message: 'Budget injection on — agents see a budget line once a key is half spent',
+          type: 'info',
+        });
+      }
+    });
+    this._renderGovStatus();
+
+    // Config -> TLS / Certificates. This is a server-side policy, so it is
+    // saved through /config the moment it changes (like the proxy and the
+    // sandbox paths) rather than with the browser settings on SAVE.
+    const tlsSel = document.getElementById('sbTlsVerify');
+    const tlsStatus = (mode, ca) => {
+      const el = document.getElementById('sbTlsStatus');
+      if (!el) return;
+      if (mode === 'off') {
+        el.textContent = 'Off: any certificate is accepted and the hostname is not checked, so the API key and your prompts go to whoever answers.';
+      } else if (mode === 'on') {
+        el.textContent = ca
+          ? `Verifying every host, with the CA bundle at ${ca}.`
+          : 'Verifying every host. A self-signed LAN endpoint refuses to connect until a CA bundle is set or this goes back to Auto.';
+      } else {
+        el.textContent = 'Auto: public hosts verified; localhost, LAN addresses and single-word host names skipped, so a self-signed local runner keeps working.';
+      }
+    };
+    // The pin list. Read back from the server rather than remembered here: the
+    // bundle is a file the operator may also edit, and a stale row would offer
+    // a FORGET that quietly does nothing.
+    const renderPins = async () => {
+      const box = document.getElementById('sbTlsPins');
+      const count = document.getElementById('sbTlsPinCount');
+      if (!box) return;
+      try {
+        const r = await api.tlsPins();
+        const pins = (r && r.pins) || [];
+        if (count) count.textContent = pins.length ? `${pins.length} TRUSTED` : '';
+        if (!pins.length) {
+          box.innerHTML = '<div class="form-hint">Nothing pinned. A self-signed LAN host stays unverified under Auto, and is refused under Always verify, until its certificate is pinned above.</div>';
+          return;
+        }
+        box.innerHTML = pins.map((p) => {
+          const name = p.subject || p.host || 'certificate';
+          const validity = p.expired === true
+            ? `EXPIRED ${p.to || ''}`.trim()
+            : (p.expiring === true
+              ? `EXPIRES IN ${p.days_left} DAY${p.days_left === 1 ? '' : 'S'}${p.to ? ` (${p.to})` : ''}`
+              : (p.to ? `valid to ${p.to}` : 'validity unknown'));
+          const alarm = p.expired === true || p.expiring === true;
+          const pinned = p.pinned_at ? ` - pinned ${new Date(p.pinned_at * 1000).toLocaleDateString()}` : '';
+          return `<div style="padding:8px 0;border-top:1px solid rgba(120,140,160,.25)">`
+            + `<div style="font-size:12px">${esc(name)}</div>`
+            + `<div class="form-hint" style="word-break:break-all">SHA-256 ${esc(p.fingerprint)}</div>`
+            + `<div class="form-hint"${alarm ? ' style="color:#ffb74d"' : ''}>${esc(validity)}${esc(pinned)}</div>`
+            + `<button class="btn btn-ghost btn-sm" data-forget="${esc(p.fingerprint)}">FORGET</button>`
+            + '</div>';
+        }).join('');
+        box.querySelectorAll('[data-forget]').forEach((btn) => {
+          btn.addEventListener('click', async () => {
+            const fp = btn.getAttribute('data-forget') || '';
+            try {
+              const res = await api.tlsForget(fp);
+              if (res && res.ok) {
+                store.emit('toast', { message: 'Certificate forgotten - pin it again to restore trust', type: 'info' });
+                renderPins();
+                tlsStatus(tlsSel.value, (document.getElementById('sbTlsCa')?.value || '').trim());
+              } else {
+                store.emit('toast', { message: (res && res.error) || 'Not forgotten', type: 'error' });
+              }
+            } catch (e) {
+              store.emit('toast', { message: `Not forgotten: ${e.message}`, type: 'error' });
+            }
+          });
+        });
+      } catch (e) {
+        if (count) count.textContent = '';
+        box.textContent = `Could not list pinned certificates: ${e.message}`;
+      }
+    };
+    const tlsLoad = () => {
+      api.getConfig()
+        .then((cfg) => {
+          const tls = (cfg && cfg.tls) || {};
+          const mode = tls.verify || 'auto';
+          if (tlsSel) tlsSel.value = mode;
+          const ca = document.getElementById('sbTlsCa');
+          if (ca && typeof tls.ca_bundle === 'string') ca.value = tls.ca_bundle;
+          tlsStatus(mode, tls.ca_bundle || '');
+          renderPins();
+        })
+        .catch(() => { if (tlsSel) tlsStatus(tlsSel.value, ''); });
+    };
+    if (tlsSel) {
+      tlsLoad();
+      tlsSel.addEventListener('change', async () => {
+        const mode = tlsSel.value;
+        try {
+          await this._patchServerConfig((cfg) => {
+            cfg.tls = { ...(cfg.tls || {}), verify: mode };
+          });
+          tlsStatus(mode, (document.getElementById('sbTlsCa')?.value || '').trim());
+          store.emit('toast', {
+            message: mode === 'off'
+              ? 'Certificate checks OFF - any host is trusted'
+              : (mode === 'on' ? 'Certificates verified on every call' : 'Certificates verified except on LAN and loopback'),
+            type: mode === 'off' ? 'error' : 'success',
+          });
+        } catch (e) {
+          store.emit('toast', { message: `TLS setting not saved: ${e.message}`, type: 'error' });
+        }
+      });
+      const hostInput = document.getElementById('sbTlsHost');
+      const certLine = (r) => {
+        const el = document.getElementById('sbTlsCertStatus');
+        if (!el) return;
+        if (!r || !r.ok) {
+          el.textContent = (r && r.error) || 'Could not read a certificate.';
+          return;
+        }
+        el.textContent = `${r.subject || r.host} - issued by ${r.issuer || 'unknown'} - valid ${r.from || '?'} to ${r.to || '?'} - ${r.chain} cert(s) - SHA-256 ${r.fingerprint}`
+          + (r.already_pinned ? ' (already pinned)' : '')
+          + (r.written ? ` - saved to ${r.bundle}` : '')
+          + (r.note ? ` - ${r.note}` : '');
+      };
+      const tlsUrl = () => (hostInput?.value || '').trim();
+      document.getElementById('sbTlsCheck')?.addEventListener('click', async () => {
+        const url = tlsUrl();
+        if (!url) {
+          certLine({ ok: false, error: 'Paste the endpoint URL first, e.g. https://192.168.1.50:1234' });
+          return;
+        }
+        try { certLine(await api.tlsInspect(url)); }
+        catch (e) { certLine({ ok: false, error: e.message }); }
+      });
+      document.getElementById('sbTlsPin')?.addEventListener('click', async () => {
+        const url = tlsUrl();
+        if (!url) {
+          certLine({ ok: false, error: 'Paste the endpoint URL first, e.g. https://192.168.1.50:1234' });
+          return;
+        }
+        try {
+          const r = await api.tlsPin(url);
+          certLine(r);
+          if (r && r.ok) {
+            store.emit('toast', {
+              message: r.written ? 'Certificate pinned' : 'That certificate was already pinned',
+              type: 'success',
+            });
+            tlsStatus(tlsSel.value, (document.getElementById('sbTlsCa')?.value || '').trim());
+            renderPins();
+          }
+        } catch (e) { certLine({ ok: false, error: e.message }); }
+      });
+      const caInput = document.getElementById('sbTlsCa');
+      caInput?.addEventListener('change', async () => {
+        const bundle = caInput.value.trim();
+        try {
+          await this._patchServerConfig((cfg) => {
+            cfg.tls = { ...(cfg.tls || {}), ca_bundle: bundle };
+            if (!bundle) delete cfg.tls.ca_bundle;
+          });
+          tlsStatus(tlsSel.value, bundle);
+          store.emit('toast', {
+            message: bundle ? 'CA bundle saved' : 'CA bundle cleared',
+            type: 'success',
+          });
+        } catch (e) {
+          store.emit('toast', { message: `CA bundle not saved: ${e.message}`, type: 'error' });
+        }
+      });
+    }
+
+    // Save (writes current field values through, confirms to user)
+    document.getElementById('sbSaveBtn').addEventListener('click', async () => {
+      const theme = document.getElementById('sbTheme')?.value;
+      const temp = parseFloat(document.getElementById('sbTemp')?.value);
+      const maxTokens = parseInt(document.getElementById('sbMaxTokens')?.value, 10);
+      if (theme) {
+        store.set('settings.theme', theme);
+        store.emit('theme:change', theme);
+      }
+      if (isFinite(temp)) {
+        store.set('settings.temperature', temp);
+        try { localStorage.setItem(K.TEMP, String(temp)); } catch {}
+      }
+      if (isFinite(maxTokens)) {
+        store.set('settings.maxTokens', maxTokens);
+        try { localStorage.setItem(K.MAX_TOKENS, String(maxTokens)); } catch {}
+      }
+      // If the field is missing for any reason, KEEP the current value rather
+      // than defaulting to 0: `parseInt(undefined) || 0` would silently turn
+      // every agent's conversation memory off on a SAVE.
+      const historyTurns = (() => {
+        const el = document.getElementById('sbHistoryTurns');
+        if (!el) return store.get('settings.historyTurns') ?? DEFAULT_HISTORY_TURNS;
+        const n = parseInt(el.value, 10);
+        return Number.isFinite(n) ? Math.max(0, Math.min(50, n))
+          : (store.get('settings.historyTurns') ?? DEFAULT_HISTORY_TURNS);
+      })();
+      store.set('settings.historyTurns', historyTurns);
+      try { localStorage.setItem(K.HISTORY_TURNS, String(historyTurns)); } catch {}
+
+      // Always-on fields are live-toggled but the numbers land on SAVE, the
+      // same as every other field in this tab.
+      const clamp = (id, min, max, fallback) => {
+        const el = document.getElementById(id);
+        const n = parseInt(el?.value, 10);
+        return Math.max(min, Math.min(max, Number.isFinite(n) ? n : fallback));
+      };
+      store.set('settings.alwaysOnIntervalSec', clamp('sbAlwaysOnInterval', 10, 3600, 30));
+      store.set('settings.alwaysOnGraceSec', clamp('sbAlwaysOnGrace', 0, 3600, 20));
+      store.set('settings.alwaysOnMaxIterations', clamp('sbAlwaysOnMaxIter', 0, 10000, 0));
+      store.set('settings.alwaysOnMaxMinutes', clamp('sbAlwaysOnMaxMin', 0, 100000, 0));
+      // Rate governor numbers land on SAVE; the toggles above are already live.
+      store.set('settings.rateLimitRpm', clamp('sbGovRpm', 0, 600, 0));
+      store.set('settings.rateLimitMaxWaitMs', clamp('sbGovMaxWait', 5, 600, 65) * 1000);
+      store.set('settings.tokenBudget', clamp('sbTokenBudget', 0, 1000000000, 0));
+
+      persistence.set('settings', store.get('settings'));
+      store.emit('settings:changed');
+      this._renderAlwaysOnStatus();
+      // Nothing is pending any more: drop the dots and say so in the bar.
+      this.bodyEl.querySelectorAll('details.cfg-section.dirty').forEach(d => d.classList.remove('dirty'));
+      this._cfgPendingDir = null;
+      const hint = document.getElementById('cfgSaveHint');
+      if (hint) hint.textContent = 'Saved ✓';
+      store.emit('toast', { message: 'Configuration saved', type: 'success' });
+
+      // The working directory lives on the server, so it saves separately from
+      // the browser-side settings above. A failure here must not look like the
+      // whole save worked, hence its own toast.
+      const dirInput = document.getElementById('sbProjectDir');
+      if (dirInput) {
+        try {
+          const dir = await this._saveProjectDir(dirInput.value);
+          // Agents need to know where they are; keep it in the store so the
+          // tool instructions can tell them without another round trip.
+          store.set('settings.projectDir', dir);
+          persistence.set('settings', store.get('settings'));
+          store.emit('sandbox:dirChanged', dir);
+          store.emit('toast', {
+            message: dir ? `Working directory: ${dir}` : 'File tools disabled',
+            type: 'success',
+          });
+        } catch (err) {
+          // Say so here too: the field still holds the rejected text, and the
+          // old success message would otherwise still be sitting underneath it.
+          const status = document.getElementById('sbProjectStatus');
+          if (status) status.textContent = `Not saved: ${err.message}`;
+          store.emit('toast', {
+            message: `Working directory not saved: ${err.message}`, type: 'error',
+          });
+        }
+      }
+    });
+
+    // Usage modal: this app's totals + per-agent breakdown
+    document.getElementById('sbUsageBtn').addEventListener('click', () => {
+      store.emit('metrics:showUsage');
+    });
+
+    // Run trace: a sequenced timeline of model turns and tool calls.
+    document.getElementById('sbTraceBtn')?.addEventListener('click', () => {
+      store.emit('trace:show');
+    });
+
+    // Diagnose: one click, every provider, the failing layer named.
+    // "NetworkError when attempting to fetch resource" tells the operator
+    // nothing about WHICH of four things is broken; this tells them.
+    document.getElementById('sbDiagBtn')?.addEventListener('click', async () => {
+      const out = document.getElementById('sbDiagOut');
+      const hint = document.getElementById('sbDiagHint');
+      const providers = store.get('providers') || [];
+      if (!providers.length) {
+        store.emit('toast', { message: 'No providers configured yet.', type: 'error' });
+        return;
+      }
+      if (String(store.get('settings.routerToken') || '').trim() === '') {
+        store.emit('toast', {
+          message: 'Paste your access token into the Access token box above first — a diagnosis cannot reach the server without it.',
+          type: 'error',
+        });
+        return;
+      }
+      out.innerHTML = '<div class="form-hint">Testing…</div>';
+      // One probe per provider: its endpoint, its key, and a model any of
+      // its agents uses (the model only affects the message the provider
+      // returns; reaching it at all is what is being tested).
+      const probes = providers.map(p => ({
+        name: p.name,
+        endpoint: p.endpoint || '',
+        api_key: p.apiKey || '',
+        model: ((store.get('agents') || []).find(a => a.provider === p.id) || {}).model || '',
+      }));
+      try {
+        const res = await api.diagnoseProviders(probes);
+        const rows = (res && res.results) || [];
+        // An empty result set used to render as "All 0 provider(s) reachable",
+        // which reads like a pass. It is not a pass: it means the server
+        // answered nothing to test, which is what a refused (401) request
+        // looks like from here. Say THAT instead of claiming success.
+        if (!rows.length) {
+          // Say which half is at fault. `sent` is what this browser handed
+          // over; `received` is what the server says it got. Equal-and-zero
+          // means the request never reached a server that knows about /diag
+          // (an old copy still loaded), so it is not a network or key fault.
+          const received = res && typeof res.received === 'number' ? res.received : 'unknown';
+          out.innerHTML = '<div class="form-hint" style="color:var(--accent-red)">'
+            + `Nothing was tested. This browser sent ${probes.length} provider(s); `
+            + `the server reports it received ${received}. `
+            + (received === 0
+              ? 'A server that answered but received nothing is an older copy '
+                + 'still loaded — hard-refresh, and check the version badge.'
+              : 'Check the Access token above.')
+            + '</div>';
+          if (hint) hint.textContent = 'Nothing was tested.';
+          store.emit('toast', { message: `Nothing tested (sent ${probes.length}, received ${received})`, type: 'error' });
+          return;
+        }
+        // Which copy answered, printed before the results. Cheap, and it settles
+        // "am I even looking at the folder I think I am?".
+        const srv = res && res.server;
+        if (srv) {
+          const badge = document.createElement('div');
+          badge.className = 'form-hint';
+          badge.style.cssText = 'font-family:var(--font-mono);font-size:10px;margin:0 0 8px;word-break:break-all';
+          badge.textContent = `server: ${srv.software} · PHP ${srv.php} · ${srv.path}`
+            // Worth saying here as well as at load: this is where an operator
+            // comes to ask "why is it slow / why do the agents queue?".
+            + (srv.concurrency && srv.concurrency.concurrent === false
+              ? ' · ⚠ one request at a time — agents take turns (use start.bat)'
+              : '');
+          out.appendChild(badge);
+        }
+        const LABEL = {
+          ok: 'reachable', dns: 'DNS failed', tls: 'TLS refused',
+          connect: 'no route / refused', auth: 'key rejected',
+          http: 'provider refused', config: 'misconfigured', local: 'local server',
+        };
+        out.innerHTML = '';
+        rows.forEach(r => {
+          const row = document.createElement('div');
+          row.className = 'exec-approval';
+          const head = document.createElement('div');
+          head.className = 'exec-approval-cmd';
+          head.textContent = r.name;
+          const why = document.createElement('div');
+          why.className = 'exec-approval-who';
+          why.textContent = `${(LABEL[r.stage] || r.stage).toUpperCase()} · ${r.ms != null ? r.ms + 'ms' : ''} `
+            + `${r.code ? '· HTTP ' + r.code : ''} — ${r.message || ''}`;
+          const fix = {
+            dns: 'This machine cannot resolve that hostname. Check DNS, a VPN, or an offline connection.',
+            tls: 'The certificate was refused. Often a middlebox or an old trust store — check your clock too.',
+            connect: 'Nothing answered at that address. Check the endpoint URL, firewall, or whether you are behind a network that blocks it.',
+            auth: 'The key was rejected by the provider. Re-copy it; check it is the right kind of key and that it has credit.',
+            http: 'The provider answered but refused the call. The message above carries the reason — a wrong model id is the usual one.',
+            config: 'The endpoint is missing or is not a URL.',
+            local: 'This app did not answer — is the server window still running?',
+          }[r.stage];
+          if (fix) {
+            const advice = document.createElement('div');
+            advice.className = 'form-hint';
+            advice.style.marginTop = '4px';
+            advice.textContent = fix;
+            row.appendChild(head); row.appendChild(why); row.appendChild(advice);
+          } else {
+            row.appendChild(head); row.appendChild(why);
+          }
+          out.appendChild(row);
+        });
+        const bad = rows.filter(r => !r.ok).length;
+        if (hint) {
+          hint.textContent = bad
+            ? `${bad} of ${rows.length} provider(s) cannot be reached from this machine. The first line above is where it stops.`
+            : `All ${rows.length} provider(s) reachable — the network is fine; if models still fail, the cause is inside the app or the key.`;
+        }
+        store.emit('toast', {
+          message: bad ? `${bad}/${rows.length} provider(s) unreachable` : 'All providers reachable',
+          type: bad ? 'error' : 'success',
+        });
+      } catch (err) {
+        out.innerHTML = `<div class="form-hint" style="color:var(--accent-red)">Diagnosis failed: ${(err && err.message) || err}</div>`;
+      }
+    });
+
+    // Export
+    document.getElementById('sbExportBtn').addEventListener('click', () => {
+      store.emit('export:open');
+    });
+
+    // Every API call is behind the access-token gate, and a backup/restore is
+    // an API call. Without this check the POST simply came back 401 and the
+    // app looked broken: "I pressed restore and nothing happened". Checked up
+    // front so the reason is said out loud.
+    const needToken = what => {
+      if (String(store.get('settings.routerToken') || '').trim()) return false;
+      store.emit('toast', {
+        message: `Paste your access token into Config → Access token first — ${what} cannot reach the server without it.`,
+        type: 'error',
+      });
+      return true;
+    };
+
+    // Full backup: a dialog names the file and picks the sections, so "just
+    // my providers" no longer means carrying everyone's sessions with it.
+    document.getElementById('sbBackupBtn')?.addEventListener('click', () => {
+      if (needToken('a backup')) return;
+      this._openBackupDialog();
+    });
+
+    // Restore: pick a file, then a dialog offers the sections THAT file
+    // carries. Sections it does not carry are left alone on this copy --
+    // never blanked -- which is what makes a partial or older backup safe.
+    document.getElementById('sbRestoreBtn')?.addEventListener('click', () => {
+      document.getElementById('sbRestoreFile')?.click();
+    });
+    document.getElementById('sbRestoreFile')?.addEventListener('change', async (e) => {
+      const file = e.target.files ? e.target.files[0] : null;
+      e.target.value = '';
+      if (!file) return;
+      // Same gate as the backup above: read the file first so the token
+      // complaint is not wasted on a file that wasn't even chosen, then say
+      // why nothing is about to happen.
+      if (needToken('a restore')) return;
+      let backup = null;
+      try {
+        backup = JSON.parse(await file.text());
+      } catch {
+        store.emit('toast', { message: 'That file is not valid JSON', type: 'error' });
+        return;
+      }
+      if (!backup || backup.app !== 'router-studio') {
+        store.emit('toast', { message: 'Not an Autonomous Loop Studio backup file', type: 'error' });
+        return;
+      }
+      this._openRestoreDialog(backup);
+    });
+
+    // Reset
+    document.getElementById('sbResetBtn').addEventListener('click', () => {
+      if (confirm('Reset all data? This will clear all agents, providers, and settings.')) {
+        persistence.resetAll();
+        store.emit('toast', { message: 'All data reset', type: 'info' });
+        store.emit('app:reload');
+      }
+    });
+  }
+
+  /**
+   * Backup dialog: a name for the file and a checkbox per section. Sections
+   * download straight to the device, so the file moves between copies and
+   * versions freely. Closes on Cancel, the backdrop, or Escape.
+   */
+  _openBackupDialog() {
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    const stamp = defaultBackupName();
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-label="Download backup">
+        <div class="modal-header">
+          <span class="modal-title">Download backup</span>
+          <button class="modal-close" data-close aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">File name</label>
+            <input type="text" class="form-input" data-name value="${escAttr(stamp)}" maxlength="80" autocomplete="off">
+            <div class="form-hint">Saved as <span data-filename>${esc(stamp)}.json</span> on your device.</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Include
+              <span class="form-hint-inline"><a href="#" data-all>all</a> &middot; <a href="#" data-none>none</a></span>
+            </label>
+            <div data-sections>
+              ${BACKUP_SECTIONS.map(sec => `
+                <label class="bk-check"><input type="checkbox" data-section="${sec.id}" checked>
+                  <span><b>${esc(sec.label)}</b><br>
+                  <span class="form-hint" style="margin:0">${esc(sec.hint)}</span></span>
+                </label>`).join('')}
+            </div>
+            <div class="form-hint">Holds API keys and the access token — keep the file somewhere safe, never post it.</div>
+          </div>
+          <div class="form-hint" data-status style="min-height:1.2em"></div>
+        </div>
+        <div class="modal-footer">
+          <button class="btn btn-ghost" data-close>Cancel</button>
+          <button class="btn btn-primary" data-download>Download</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const say = (text) => { const el = overlay.querySelector('[data-status]'); if (el) el.textContent = text; };
+    const close = () => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+    };
+    function onKey(e) { if (e.key === 'Escape') close(); }
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay || e.target.closest('[data-close]')) close();
+    });
+    document.addEventListener('keydown', onKey);
+    const nameInput = overlay.querySelector('[data-name]');
+    const fileLabel = overlay.querySelector('[data-filename]');
+    nameInput.addEventListener('input', () => {
+      fileLabel.textContent = sanitizeBackupName(nameInput.value, stamp) + '.json';
+    });
+    overlay.querySelector('[data-all]').addEventListener('click', (e) => {
+      e.preventDefault();
+      overlay.querySelectorAll('[data-section]').forEach(c => { c.checked = true; });
+    });
+    overlay.querySelector('[data-none]').addEventListener('click', (e) => {
+      e.preventDefault();
+      overlay.querySelectorAll('[data-section]').forEach(c => { c.checked = false; });
+    });
+    const dlBtn = overlay.querySelector('[data-download]');
+    dlBtn.addEventListener('click', async () => {
+      const sections = [...overlay.querySelectorAll('[data-section]:checked')].map(c => c.dataset.section);
+      if (!sections.length) { say('Pick at least one section — or Cancel.'); return; }
+      const name = sanitizeBackupName(nameInput.value, stamp);
+      dlBtn.disabled = true;
+      say('Preparing the backup…');
+      try {
+        const data = await api.downloadBackup(sections, name);
+        downloadFile(JSON.stringify(data, null, 2), name + '.json', 'application/json');
+        close();
+        store.emit('toast', {
+          message: `Backup downloaded as ${name}.json — it holds keys and the token, keep it somewhere safe`,
+          type: 'success',
+        });
+      } catch (err) {
+        say('Backup failed: ' + (err?.message || err));
+        dlBtn.disabled = false;
+      }
+    });
+    nameInput.focus();
+    nameInput.select();
+  }
+
+  /**
+   * Restore dialog: says what the file holds (name, date, release, parts),
+   * offers the sections it carries, and warns when the file came from a copy
+   * with a different access token -- this copy keeps its own, so there is
+   * nothing to paste. After a restore the dialog reports exactly what landed
+   * and what was skipped, with a Reload button; nothing reloads underneath
+   * the report.
+   */
+  _openRestoreDialog(backup) {
+    const sum = summarizeBackup(backup);
+    const present = new Set(sum.sections);
+    const labelOf = (id) => (BACKUP_SECTIONS.find(sec => sec.id === id) || {}).label || id;
+    const when = sum.exportedAt ? new Date(sum.exportedAt * 1000).toLocaleString() : 'unknown date';
+    const differs = backupTokenDiffers(backup, store.get('settings.routerToken'));
+    const nSessions = Array.isArray(backup.sessions) ? backup.sessions.length : 0;
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal" role="dialog" aria-label="Restore backup">
+        <div class="modal-header">
+          <span class="modal-title">Restore backup</span>
+          <button class="modal-close" data-close aria-label="Close">&times;</button>
+        </div>
+        <div class="modal-body" data-body>
+          <div class="form-group">
+            <label class="form-label">This file</label>
+            <div><b>${esc(sum.name || 'Unnamed backup')}</b></div>
+            <div class="form-hint" style="margin:4px 0 0">
+              Exported ${esc(when)}${sum.exportedFrom ? ` · from release v${esc(sum.exportedFrom)}` : ''}
+              ${nSessions ? ` · ${nSessions} session(s)` : ''}</div>
+            ${differs ? `<div class="form-hint" style="margin:4px 0 0">
+              From a copy with a <b>different access token</b> — this copy keeps its own,
+              so you stay logged in as now and there is nothing to paste.</div>` : ''}
+          </div>
+          <div class="form-group">
+            <label class="form-label">Restore
+              <span class="form-hint-inline"><a href="#" data-all>all</a> &middot; <a href="#" data-none>none</a></span>
+            </label>
+            <div data-sections>
+              ${BACKUP_SECTIONS.map(sec => present.has(sec.id) ? `
+                <label class="bk-check"><input type="checkbox" data-section="${sec.id}" checked>
+                  <span><b>${esc(sec.label)}</b><br>
+                  <span class="form-hint" style="margin:0">${esc(sec.hint)}</span></span>
+                </label>` : `
+                <label class="bk-check bk-missing"><input type="checkbox" disabled>
+                  <span><b>${esc(sec.label)}</b><br>
+                  <span class="form-hint" style="margin:0">Not in this backup — left alone.</span></span>
+                </label>`).join('')}
+            </div>
+            <div class="form-hint">Restoring REPLACES the parts you pick — sessions, agents,
+              providers, settings — with what the file holds. Parts the file does not
+              carry are never touched. Export first if unsure.</div>
+          </div>
+          <div class="form-hint" data-status style="min-height:1.2em"></div>
+        </div>
+        <div class="modal-footer" data-footer>
+          <button class="btn btn-ghost" data-close>Cancel</button>
+          <button class="btn btn-primary" data-restore>Restore</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const say = (text) => { const el = overlay.querySelector('[data-status]'); if (el) el.textContent = text; };
+    const close = () => {
+      document.removeEventListener('keydown', onKey);
+      overlay.remove();
+    };
+    function onKey(e) { if (e.key === 'Escape') close(); }
+    overlay.addEventListener('click', (e) => {
+      if (e.target === overlay || e.target.closest('[data-close]')) close();
+    });
+    document.addEventListener('keydown', onKey);
+    overlay.querySelector('[data-all]').addEventListener('click', (e) => {
+      e.preventDefault();
+      overlay.querySelectorAll('[data-section]:not([disabled])').forEach(c => { c.checked = true; });
+    });
+    overlay.querySelector('[data-none]').addEventListener('click', (e) => {
+      e.preventDefault();
+      overlay.querySelectorAll('[data-section]').forEach(c => { c.checked = false; });
+    });
+    overlay.querySelector('[data-restore]').addEventListener('click', async () => {
+      const only = [...overlay.querySelectorAll('[data-section]:checked')].map(c => c.dataset.section);
+      if (!only.length) { say('Pick at least one section — or Cancel.'); return; }
+      const btn = overlay.querySelector('[data-restore]');
+      btn.disabled = true;
+      say('Restoring…');
+      let res = null;
+      try {
+        res = await api.importBackup(backup, only);
+      } catch (err) {
+        say('Restore failed: ' + (err?.message || err));
+        btn.disabled = false;
+        return;
+      }
+      if (!res || !res.success) {
+        say('Restore failed: ' + ((res && res.error) || 'unknown error'));
+        btn.disabled = false;
+        return;
+      }
+      const restored = (res.restored || []).map(labelOf);
+      const skipped = res.skipped || [];
+      const kept = res.kept_local || [];
+      overlay.querySelector('[data-body]').innerHTML = `
+        <div class="form-group">
+          <label class="form-label">Restored</label>
+          <div>${restored.length ? restored.map(esc).join('<br>') : 'Nothing — every section was skipped.'}</div>
+          ${res.sessions != null ? `<div class="form-hint" style="margin:4px 0 0">${res.sessions} session(s) written.</div>` : ''}
+          ${skipped.length ? `<div class="form-hint" style="margin:4px 0 0">Skipped: ${skipped.map(sk => esc(labelOf(sk.section)) + ' (' + esc(sk.reason) + ')').join('; ')}.</div>` : ''}
+          ${kept.length ? `<div class="form-hint" style="margin:4px 0 0">Kept this copy's own: ${kept.map(esc).join('; ')}.</div>` : ''}
+          ${res.token_differs ? `<div class="form-hint" style="margin:4px 0 0">The file came from a copy with a different access token — this copy's own still applies.</div>` : ''}
+        </div>`;
+      overlay.querySelector('[data-footer]').innerHTML = `
+        <button class="btn btn-ghost" data-close2>Later</button>
+        <button class="btn btn-primary" data-reload>Reload now</button>`;
+      overlay.querySelector('[data-close2]').addEventListener('click', close);
+      overlay.querySelector('[data-reload]').addEventListener('click', () => location.reload());
+      store.emit('toast', { message: `Restored ${restored.length} section(s) — reload to see everything`, type: 'success' });
+    });
+  }
+
+  /**
+   * MCP *server* section: this app AS a server friends connect to. Config lives
+   * in config.json (server-side). Tokens never expire and are revoked with ×.
+   */
+  _initMcpServerSection() {
+    document.getElementById('sbMcpSrvOn')?.addEventListener('click', (e) => {
+      e.currentTarget.classList.toggle('active');
+    });
+    document.getElementById('sbMcpSrvAdd')?.addEventListener('click', () => {
+      if (!this._mcpSrv) this._mcpSrv = { enabled: false, root: '', protect: [], tokens: [] };
+      this._mcpSrv.tokens = [...(this._mcpSrv.tokens || []), { label: '', token: '', scope: ['read'], ips: [] }];
+      this._renderMcpSrvTokens();
+    });
+    document.getElementById('sbMcpSrvSave')?.addEventListener('click', () => this._saveMcpServer());
+
+    if (!this._mcpSrv) {
+      api.mcpServerConfig().then(res => {
+        if (!document.getElementById('sbMcpSrvTokens')) return; // tab changed
+        this._mcpSrv = {
+          enabled: !!res.enabled, root: res.root || '',
+          protect: res.protect || res.defaultProtect || [], tokens: res.tokens || [],
+        };
+        const on = document.getElementById('sbMcpSrvOn');
+        if (on) on.classList.toggle('active', this._mcpSrv.enabled);
+        const rootEl = document.getElementById('sbMcpSrvRoot');
+        if (rootEl && !rootEl.value) rootEl.value = this._mcpSrv.root;
+        const pEl = document.getElementById('sbMcpSrvProtect');
+        if (pEl && !pEl.value.trim()) pEl.value = (this._mcpSrv.protect || []).join('\n');
+        this._renderMcpSrvTokens();
+      }).catch(() => {
+        this._mcpSrv = { enabled: false, root: '', protect: [], tokens: [] };
+        this._renderMcpSrvTokens();
+      });
+    } else {
+      this._renderMcpSrvTokens();
+    }
+  }
+
+  _renderMcpSrvTokens() {
+    const el = document.getElementById('sbMcpSrvTokens');
+    if (!el) return;
+    const toks = this._mcpSrv?.tokens || [];
+    if (!toks.length) { el.innerHTML = '<div class="form-hint">No friends yet.</div>'; return; }
+    const sc = (t, s) => ((t.scope || []).includes(s) ? ' checked' : '');
+    el.innerHTML = toks.map((t, i) => {
+      // A stored token is not readable from this screen any more, so the field
+      // shows the plaintext only for a token this page just had issued, and the
+      // mask otherwise.
+      const fresh = t.id ? (this._mcpSrvFresh[t.id] || '') : '';
+      const shown = fresh || t.token || '';
+      const pending = !t.token;   // '' means "issue a new one when you save"
+      return `
+      <div data-mcpsrv-row="${i}" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px">
+        <div style="display:flex;gap:6px;align-items:center">
+          <input class="form-input" data-mcpsrv="label" value="${escAttr(t.label || '')}" placeholder="friend name" style="flex:1">
+          <button class="btn btn-ghost" data-mcpsrv-del="${i}" title="Revoke this token">&times;</button>
+        </div>
+        <div class="toggle-row" style="gap:14px;margin-top:8px;justify-content:flex-start">
+          <label class="form-hint-inline"><input type="checkbox" data-mcpsrv-scope="read" data-i="${i}"${sc(t, 'read')}> read</label>
+          <label class="form-hint-inline"><input type="checkbox" data-mcpsrv-scope="write" data-i="${i}"${sc(t, 'write')}> write</label>
+          <label class="form-hint-inline"><input type="checkbox" data-mcpsrv-scope="exec" data-i="${i}"${sc(t, 'exec')}> exec</label>
+        </div>
+        <div style="display:flex;gap:6px;margin-top:8px">
+          <input class="form-input" data-mcpsrv="token" value="${escAttr(shown)}" readonly style="flex:1;font-family:var(--font-mono);font-size:11px" title="${fresh ? 'Just issued — copy it to your friend now' : 'Stored on the server. Only a token issued in this session can be shown.'}">
+          <button class="btn btn-ghost" data-mcpsrv-copy="${i}">COPY</button>
+          <button class="btn btn-ghost" data-mcpsrv-rotate="${i}" title="Issue a new token for this friend">ROTATE</button>
+        </div>
+        <input class="form-input" data-mcpsrv="ips" value="${escAttr((t.ips || []).join(', '))}" placeholder="optional IP allowlist, comma-separated" style="margin-top:6px">
+        ${fresh ? '<div class="form-hint">New token — copy it now. It is stored on the server and this is the only time it is shown.</div>' : ''}
+        ${pending && !fresh ? '<div class="form-hint">A new token is issued when you save, and shown once. The old one stops working then.</div>' : ''}
+      </div>`;
+    }).join('');
+
+    el.querySelectorAll('[data-mcpsrv]').forEach(inp => {
+      const set = () => {
+        const row = inp.closest('[data-mcpsrv-row]');
+        const i = Number(row?.dataset.mcpsrvRow);
+        const t = this._mcpSrv?.tokens?.[i];
+        if (!t) return;
+        const f = inp.dataset.mcpsrv;
+        if (f === 'ips') t.ips = inp.value.split(',').map(s => s.trim()).filter(Boolean);
+        else t[f] = inp.value;
+      };
+      inp.addEventListener('input', set);
+      inp.addEventListener('change', set);
+    });
+    el.querySelectorAll('[data-mcpsrv-scope]').forEach(cb => {
+      cb.addEventListener('change', () => {
+        const i = Number(cb.dataset.i);
+        const t = this._mcpSrv?.tokens?.[i];
+        if (!t) return;
+        const s = cb.dataset.mcpsrvScope;
+        const set = new Set(t.scope || []);
+        if (cb.checked) set.add(s); else set.delete(s);
+        // Checking write/exec implies read, so the tool list is not half-blind.
+        if (cb.checked && (set.has('write') || set.has('exec'))) set.add('read');
+        t.scope = ['read', 'write', 'exec'].filter(x => set.has(x));
+        this._renderMcpSrvTokens();
+      });
+    });
+    el.querySelectorAll('[data-mcpsrv-del]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._mcpSrv.tokens.splice(Number(btn.dataset.mcpsrvDel), 1);
+        this._renderMcpSrvTokens();
+      });
+    });
+    el.querySelectorAll('[data-mcpsrv-copy]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const t = this._mcpSrv?.tokens?.[Number(btn.dataset.mcpsrvCopy)];
+        if (!t) return;
+        // Only a token issued in this session can be copied. Copying the field
+        // anyway would hand the friend "********", which authenticates as a
+        // wrong token -- and the failure would look like the server's fault.
+        const value = t.id ? (this._mcpSrvFresh[t.id] || '') : '';
+        if (!value) {
+          store.emit('toast', {
+            message: 'That token is stored on the server and is not shown again. ROTATE to issue a new one.',
+            type: 'info',
+          });
+          return;
+        }
+        copyToClipboard(value).then(ok => store.emit('toast', {
+          message: ok ? 'Token copied' : 'Could not reach the clipboard',
+          type: ok ? 'success' : 'error',
+        }));
+      });
+    });
+    el.querySelectorAll('[data-mcpsrv-rotate]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const i = Number(btn.dataset.mcpsrvRotate);
+        const t = this._mcpSrv?.tokens?.[i];
+        if (!t) return;
+        // '' is what tells the server to issue a new one on the next save (and
+        // it is also what tells this page a value is pending).
+        if (t.id) delete this._mcpSrvFresh[t.id];
+        t.token = '';
+        this._renderMcpSrvTokens();
+      });
+    });
+  }
+
+  async _saveMcpServer() {
+    const status = document.getElementById('sbMcpSrvStatus');
+    try {
+      const protect = (document.getElementById('sbMcpSrvProtect')?.value || '')
+        .split('\n').map(s => s.trim()).filter(Boolean);
+      const payload = {
+        enabled: !!document.getElementById('sbMcpSrvOn')?.classList.contains('active'),
+        root: (document.getElementById('sbMcpSrvRoot')?.value || '').trim(),
+        protect,
+        tokens: (this._mcpSrv?.tokens || []).map(t => ({
+          id: t.id, label: t.label, token: t.token, scope: t.scope || [], ips: t.ips || [],
+        })),
+      };
+      const res = await api.mcpServerSave(payload);
+      this._mcpSrv = {
+        enabled: !!res.enabled, root: res.root || '',
+        protect: res.protect || [], tokens: res.tokens || [],
+      };
+      // `issued` carries the plaintext of every token THIS save generated, and
+      // only this save: keep those (keyed by id) so the card can show and copy
+      // them, and drop every other id so a stale value can never be shown
+      // against a token that has since been rotated.
+      const issued = (res && res.issued) || {};
+      const fresh = {};
+      (res.tokens || []).forEach(t => {
+        if (t && t.id && issued[t.id]) fresh[t.id] = issued[t.id];
+      });
+      this._mcpSrvFresh = fresh;
+      const issuedCount = Object.keys(fresh).length;
+      const pEl = document.getElementById('sbMcpSrvProtect');
+      if (pEl) pEl.value = (this._mcpSrv.protect || []).join('\n');
+      this._renderMcpSrvTokens();
+      if (status) {
+        status.textContent = `Saved. ${this._mcpSrv.tokens.length} token(s). Endpoint: /api/mcp-server. `
+          + (issuedCount
+            ? `${issuedCount} new token(s) issued — copy each one now, it is not shown again. `
+            : 'Tokens never expire — revoke one with ×, or ROTATE to reissue, then save.');
+      }
+      store.emit('toast', { message: 'MCP server saved', type: 'success' });
+    } catch (err) {
+      if (status) status.textContent = `Not saved: ${err.message}`;
+      store.emit('toast', { message: `MCP server not saved: ${err.message}`, type: 'error' });
+    }
+  }
+
+  _normaliseMcpServers(list) {
+    return (list || []).map(s => ({
+      ...s,
+      args: Array.isArray(s.args) ? s.args.join(' ') : (s.args || ''),
+      headersText: Object.entries(s.headers || {}).map(([k, v]) => `${k}: ${v}`).join('\n'),
+      envText: Object.entries(s.env || {}).map(([k, v]) => `${k}=${v}`).join('\n'),
+    }));
+  }
+
+  _parseHeadersText(text) {
+    const out = {};
+    String(text || '').split('\n').forEach(line => {
+      const i = line.indexOf(':');
+      if (i <= 0) return;
+      const k = line.slice(0, i).trim();
+      const v = line.slice(i + 1).trim();
+      if (k) out[k] = v;
+    });
+    return out;
+  }
+
+  _parseEnvText(text) {
+    const out = {};
+    String(text || '').split('\n').forEach(line => {
+      const i = line.indexOf('=');
+      if (i <= 0) return;
+      const k = line.slice(0, i).trim();
+      const v = line.slice(i + 1).trim();
+      if (k) out[k] = v;
+    });
+    return out;
+  }
+
+  /**
+   * MCP servers: operator-configured, stored server-side in config.json.
+   * Rendered from a local cache; the server stays the source of truth.
+   */
+  _initMcpSection() {
+    document.getElementById('sbMcpAdd')?.addEventListener('click', () => {
+      this._mcpServers = [...(this._mcpServers || []), { id: '', transport: 'stdio', command: '', args: '', url: '', envText: '' }];
+      this._renderMcp();
+    });
+    document.getElementById('sbMcpSave')?.addEventListener('click', () => this._saveMcpServers());
+
+    if (this._mcpServers == null) {
+      api.mcpServers().then(res => {
+        if (!document.getElementById('sbMcpList')) return;   // tab changed
+        this._mcpServers = this._normaliseMcpServers(res.servers);
+        this._renderMcp();
+      }).catch(() => { this._mcpServers = []; this._renderMcp(); });
+    } else {
+      this._renderMcp();
+    }
+  }
+
+  _renderMcp() {
+    const el = document.getElementById('sbMcpList');
+    if (!el) return;
+    const list = this._mcpServers || [];
+    if (!list.length) { el.innerHTML = '<div class="form-hint">No servers yet.</div>'; return; }
+    el.innerHTML = list.map((s, i) => `
+      <div class="form-group" data-mcp-row="${i}" style="border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:8px">
+        <div style="display:flex;gap:6px">
+          <input class="form-input" data-mcp="id" value="${escAttr(s.id || '')}" placeholder="name" style="flex:1">
+          <select class="form-select" data-mcp="transport" style="max-width:110px">
+            <option value="stdio"${s.transport === 'http' ? '' : ' selected'}>stdio</option>
+            <option value="http"${s.transport === 'http' ? ' selected' : ''}>http</option>
+          </select>
+          <button class="btn btn-ghost" data-mcp-del="${i}" title="Remove">&times;</button>
+        </div>
+        <input class="form-input" data-mcp="command" value="${escAttr(s.command || '')}" placeholder="command (stdio), e.g. npx" style="margin-top:6px">
+        <input class="form-input" data-mcp="args" value="${escAttr(s.args || '')}" placeholder="args, space-separated (stdio)" style="margin-top:6px">
+        <textarea class="form-textarea" data-mcp="envText" rows="2" placeholder="env (stdio), one per line:&#10;GITHUB_TOKEN=…" style="margin-top:6px">${esc(s.envText || '')}</textarea>
+        <input class="form-input" data-mcp="url" value="${escAttr(s.url || '')}" placeholder="https://… (http)" style="margin-top:6px">
+        <textarea class="form-textarea" data-mcp="headersText" rows="2" placeholder="headers (http), one per line:&#10;Authorization: Bearer TOKEN" style="margin-top:6px">${esc(s.headersText || '')}</textarea>
+      </div>`).join('');
+    el.querySelectorAll('[data-mcp]').forEach(inp => {
+      const mark = () => {
+        const row = inp.closest('[data-mcp-row]');
+        if (!row) return;
+        const i = Number(row.dataset.mcpRow);
+        if (this._mcpServers[i]) this._mcpServers[i][inp.dataset.mcp] = inp.value;
+      };
+      inp.addEventListener('input', mark);
+      inp.addEventListener('change', mark);
+    });
+    el.querySelectorAll('[data-mcp-del]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        this._mcpServers.splice(Number(btn.dataset.mcpDel), 1);
+        this._renderMcp();
+      });
+    });
+  }
+
+  async _saveMcpServers() {
+    const status = document.getElementById('sbMcpStatus');
+    try {
+      const servers = (this._mcpServers || [])
+        .filter(s => String(s.id || '').trim())
+        .map(s => ({
+          id: String(s.id).trim(),
+          transport: s.transport === 'http' ? 'http' : 'stdio',
+          command: String(s.command || '').trim(),
+          args: String(s.args || '').trim() ? String(s.args).trim().split(/\s+/) : [],
+          env: this._parseEnvText(s.envText),
+          url: String(s.url || '').trim(),
+          headers: this._parseHeadersText(s.headersText),
+        }));
+      await api.mcpSaveServers(servers);
+      const res = await api.mcpServers();                 // server drops invalid rows
+      this._mcpServers = this._normaliseMcpServers(res.servers);
+      this._renderMcp();
+      if (status) status.textContent = `Saved ${this._mcpServers.length} server(s).`;
+      store.emit('toast', { message: 'MCP client saved', type: 'success' });
+      try {
+        const st = await api.mcpStatus();
+        const bad = (st.status || []).filter(x => !x.ok);
+        if (status) {
+          status.textContent += bad.length
+            ? ` Not reachable: ` + bad.map(b => `${b.id} (${b.error})`).join('; ')
+            : ' All reachable.';
+        }
+      } catch { /* status is best-effort */ }
+    } catch (err) {
+      if (status) status.textContent = `Not saved: ${err.message}`;
+      store.emit('toast', { message: `MCP client not saved: ${err.message}`, type: 'error' });
+    }
+  }
+
+  /**
+   * Show the directory the sandbox is really configured with.
+   *
+   * Read from the server rather than kept locally, because the server is what
+   * enforces it — a value cached in this browser could drift from the jail and
+   * the field would then lie about what agents can reach.
+   */
+  async _loadProjectDir() {
+    const input = document.getElementById('sbProjectDir');
+    const status = document.getElementById('sbProjectStatus');
+    if (!input) return;
+    try {
+      const s = await api.getSandboxStatus();
+      if (!document.getElementById('sbProjectDir')) return; // tab changed
+      // A path the user typed but has not saved wins over what the server
+      // reports: re-rendering the Config tab must not wipe their typing.
+      if (this._cfgPendingDir !== null) {
+        input.value = this._cfgPendingDir;
+        if (status) status.textContent = 'Typed but not saved yet — press SAVE.';
+        return;
+      }
+      input.value = (s.read_roots || [])[0] || '';
+      if (status) {
+        status.textContent = s.enabled
+          ? 'Active — agents can read and write there.'
+          : 'Not set — the file tools are off.';
+      }
+    } catch (err) {
+      if (status) status.textContent = `Could not read the current setting: ${err.message}`;
+    }
+  }
+
+  /**
+   * Whether this tab's file tools actually got their runners.
+   *
+   * The line above says where the jail points; this one says whether the tools
+   * can reach it. A tool still on its placeholder was invisible until a model
+   * called it, so a failure here looked like the model being wrong about the
+   * filesystem rather than the page being half-bound. Re-checks while the boot
+   * retries are still backing off, so opening Config early is not a stale read.
+   */
+  _loadBindState(tries = 0) {
+    const el = document.getElementById('sbBindStatus');
+    if (!el) return; // Config tab is not open, or has been rebuilt
+    const report = sandboxBindingReport();
+    if (!report.unbound.length) {
+      el.textContent = 'File tools: bound — agents can read and write in this tab.';
+      el.style.color = '';
+      el.title = '';
+      return;
+    }
+    el.textContent = 'File tools: NOT bound — ' + report.unbound.join(', ')
+      + ' still run their placeholders, so calls to them change nothing. Reload the page'
+      + (report.error ? ` (${report.error})` : '')
+      + '.';
+    el.style.color = 'var(--danger, #ff6b6b)';
+    el.title = report.error || '';
+    // Four retries after the first attempt, the last 3.2 s out; one look a
+    // second covers the whole window without a permanent timer.
+    if (tries < 6) setTimeout(() => this._loadBindState(tries + 1), 1000);
+  }
+
+  /**
+   * Bind the file tools again in this page, without a reload.
+   *
+   * The boot loop already retried five times; if it still failed -- a route
+   * that was starting, a script that landed late -- a full reload was the only
+   * cure. This runs one more attempt through the same function the boot loop
+   * uses, then reports the verdict in the line above and as a toast, so the
+   * answer appears where the question was asked.
+   */
+  _rebindFileTools() {
+    const { unbound } = bindSandboxNow(api);
+    this._loadBindState();
+    store.emit('toast', unbound.length
+      ? { message: `Still unbound: ${unbound.join(', ')}`, type: 'error' }
+      : { message: 'File tools bound — agents can read and write now', type: 'info' });
+    if (!unbound.length) store.emit('sandbox:bound');
+  }
+
+  /**
+   * Point the sandbox at one directory, for reading and writing alike.
+   *
+   * /config replaces the whole config file server-side, so the existing config
+   * is fetched and merged rather than posted as just the sandbox key — posting
+   * only the sandbox would silently drop every other stored setting.
+   */
+  async _saveProjectDir(raw) {
+    // Accept an absolute path on either platform: POSIX ("/var/www/site") or
+    // Windows ("C:\site" / "C:/site"). The old check demanded a leading "/",
+    // which no Windows path has, so on Windows the sandbox could never be
+    // pointed anywhere but its default (the app's own folder). Backslashes are
+    // normalised because the server's jail compares forward-slash paths.
+    const dir = String(raw || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    if (dir && !/^(?:[a-zA-Z]:\/?$|[a-zA-Z]:\/|\/)/.test(dir)) {
+      throw new Error('Use a full path, e.g. /var/www/site or C:\\projects\\site');
+    }
+    const status = document.getElementById('sbProjectStatus');
+    const cfg = await api.getConfig();
+    const next = {
+      ...(cfg.sandbox || {}),
+      read_roots: dir ? [dir] : [],
+      write_roots: dir ? [dir] : [],
+    };
+    await api.saveConfig({ ...cfg, sandbox: next });
+    if (status) {
+      status.textContent = dir
+        ? `Saved — agents now work in ${dir}`
+        : 'Cleared — the file tools are off.';
+    }
+    return dir;
+  }
+
+  /**
+   * A checkbox-style switch.
+   *
+   * The new value is persisted here, not only on SAVE. These toggles take
+   * effect the moment you flip them (auto-scroll changes the very next
+   * message), so requiring a second click on SAVE to keep them was a trap:
+   * the setting looked applied, then silently reverted on reload.
+   */
+  /** Read the real shell-access settings and reflect them in the toggles. */
+  async _loadExecSettings() {
+    // Listeners are attached FIRST, synchronously, outside any try/catch.
+    //
+    // They used to be attached at the bottom of the try block, after two awaits.
+    // Any failure -- a 401 from a missing token, a dropped connection, the tab
+    // being opened before the token was pasted -- jumped to the catch, so the
+    // listeners were never attached at all and the two toggles became completely
+    // inert. The click did nothing visible and nothing was logged, which reads
+    // as "the switch is broken" rather than "a fetch failed".
+    //
+    // Attaching up front means the control works whether or not the load
+    // succeeds, and the load can only ever overwrite the displayed state.
+    //
+    // Bound per ELEMENT, marked with a data attribute rather than a single
+    // instance flag: renderConfig rewrites innerHTML, so every render produces
+    // brand-new nodes. A one-shot flag would bind the first render and silently
+    // skip every render after it -- trading one dead control for another.
+    const onToggle = document.getElementById('sbExecOn');
+    if (onToggle && !onToggle.dataset.bound) {
+      onToggle.dataset.bound = '1';
+      onToggle.addEventListener('click', () => {
+        const v = onToggle.classList.toggle('active');
+        const r = document.getElementById('sbExecApprovalRow');
+        if (r) r.style.display = v ? '' : 'none';
+        this._saveExecSettings();
+      });
+    }
+    const askToggle = document.getElementById('sbExecApproval');
+    if (askToggle && !askToggle.dataset.bound) {
+      askToggle.dataset.bound = '1';
+      askToggle.addEventListener('click', () => {
+        askToggle.classList.toggle('active');
+        this._saveExecSettings();
+      });
+    }
+    const timeoutInput = document.getElementById('sbExecTimeout');
+    if (timeoutInput && !timeoutInput.dataset.bound) {
+      timeoutInput.dataset.bound = '1';
+      // `change` (blur / Enter), not `input`: saving on every keystroke would
+      // push "1" then "12" then "123", and a half-typed value clamped to the
+      // 5..600 range would fight the user mid-edit.
+      timeoutInput.addEventListener('change', () => this._saveExecSettings({ quiet: true }));
+      timeoutInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); timeoutInput.blur(); }
+      });
+    }
+
+    const codeToggle = document.getElementById('sbCodeOn');
+    if (codeToggle && !codeToggle.dataset.bound) {
+      codeToggle.dataset.bound = '1';
+      codeToggle.addEventListener('click', () => {
+        codeToggle.classList.toggle('active');
+        this._saveExecSettings({ quiet: true });
+      });
+    }
+
+    // --- Programs (real windows on this machine) ---------------------------
+    // Bound the same way as the shell toggle above: the switch saves itself and
+    // the load only ever reports what the server kept.
+    const progToggle = document.getElementById('sbProgOn');
+    if (progToggle && !progToggle.dataset.bound) {
+      progToggle.dataset.bound = '1';
+      progToggle.addEventListener('click', () => {
+        progToggle.classList.toggle('active');
+        this._savePrograms({ settingsOnly: true });
+      });
+    }
+    const progAdd = document.getElementById('sbProgAdd');
+    if (progAdd && !progAdd.dataset.bound) {
+      progAdd.dataset.bound = '1';
+      progAdd.addEventListener('click', () => this._addProgramRow({}));
+    }
+    const progSave = document.getElementById('sbProgSave');
+    if (progSave && !progSave.dataset.bound) {
+      progSave.dataset.bound = '1';
+      progSave.addEventListener('click', () => this._savePrograms({}));
+    }
+
+    // Programs live server-side too (config.json), and their rows are the
+    // launcher's allowlist, so they are rendered from the server's own view of
+    // them rather than from the config file.
+    this._loadPrograms();
+
+    try {
+      const info = await api.execAllowlist();
+      const cfg = await api.getConfig();
+      const sb = cfg.sandbox || {};
+      const on = !!info.enabled;
+      const ask = !!sb.exec_approval;
+      const set = (id, v) => document.getElementById(id)?.classList.toggle('active', v);
+      set('sbExecOn', on);
+      set('sbExecApproval', ask);
+      set('sbCodeOn', !!sb.code_enabled);
+      const row = document.getElementById('sbExecApprovalRow');
+      if (row) row.style.display = on ? '' : 'none';
+      const t = document.getElementById('sbExecTimeout');
+      if (t) t.value = sb.exec_timeout ?? 60;
+      const st = document.getElementById('sbExecStatus');
+      if (st) {
+        st.textContent = on
+          ? `On — ${(info.allow || []).length} commands allowed.`
+          : 'Off. Agents cannot run any command.';
+      }
+
+    } catch (err) {
+      // Say what happened. The toggles still work -- their listeners are
+      // already attached -- but the displayed state is unverified, so make that
+      // obvious rather than leaving stale switches looking authoritative.
+      const st = document.getElementById('sbExecStatus');
+      if (st) st.textContent = `Could not read the current setting: ${err.message}. `
+        + 'Toggles still work; the shown state may be out of date.';
+      console.warn('[config] could not load exec settings', err);
+    }
+  }
+
+  /**
+   * Read-modify-write the server config without losing a concurrent edit.
+   *
+   * PUT /config replaces the entire file rather than merging, so two overlapping
+   * savers (the shell settings and the allow/deny editor both touch `sandbox`)
+   * each read a snapshot, change one key, and PUT the lot -- the second write
+   * silently reverts the first. Chaining them through one promise makes the
+   * writes take effect in order instead.
+   */
+  _patchServerConfig(mutator) {
+    this._cfgChain = (this._cfgChain || Promise.resolve()).then(async () => {
+      const cfg = await api.getConfig();
+      mutator(cfg);
+      await api.saveConfig(cfg);
+      return cfg;
+    });
+    return this._cfgChain;
+  }
+
+  async _saveExecSettings(opts = {}) {
+    const quiet = !!opts.quiet;
+    const el = id => document.getElementById(id);
+    const on = el('sbExecOn')?.classList.contains('active');
+    const ask = el('sbExecApproval')?.classList.contains('active');
+    const timeout = Math.max(5, Math.min(600, parseInt(el('sbExecTimeout')?.value, 10) || 60));
+    const st = el('sbExecStatus');
+    let info = { allow: [] };
+    try { info = (await api.execAllowlist()) || { allow: [] }; } catch { /* count unknown */ }
+    // (info is read before the patch so the status line can show the count.)
+    // Write the clamped value back, otherwise 9999 stays on screen looking
+    // saved while the server is holding 600.
+    const tEl = el('sbExecTimeout');
+    if (tEl && String(tEl.value) !== String(timeout)) tEl.value = timeout;
+    try {
+      await this._patchServerConfig((cfg) => {
+        cfg.sandbox = cfg.sandbox || {};
+        cfg.sandbox.exec_enabled = !!on;
+        cfg.sandbox.exec_approval = !!ask;
+        cfg.sandbox.exec_timeout = timeout;
+        cfg.sandbox.code_enabled = !!el('sbCodeOn')?.classList.contains('active');
+      });
+      if (st) st.textContent = on
+        ? `${ask ? 'On' : 'On, no approval'} — ${timeout}s timeout, ${(info.allow || []).length} commands allowed.`
+        : 'Off. Agents cannot run any command.';
+      store.emit('toast', {
+        message: quiet ? `Command timeout set to ${timeout}s` : (on ? 'Shell access enabled' : 'Shell access disabled'),
+        type: quiet ? 'info' : (on ? 'success' : 'info'),
+      });
+      this._pollApprovals();
+    } catch (err) {
+      if (st) st.textContent = `Not saved: ${err.message}`;
+      store.emit('toast', { message: `Shell access not saved: ${err.message}`, type: 'error' });
+    }
+  }
+
+  // --- Programs (Config -> Shell access -> Programs) ---------------------
+  //
+  // Rendered from the SERVER's view of the list (POST /sandbox/program,
+  // action:list) rather than from the raw config, so a row the launcher would
+  // drop or refuse cannot sit here looking configured. The verdicts under each
+  // row are the only place an operator finds out that a path is wrong.
+
+  async _loadPrograms() {
+    const host = document.getElementById('sbProgList');
+    if (!host) return;
+    try {
+      const res = await api.sandbox('program', { action: 'list' });
+      this._progPlatform = res.platform || '';
+      this._progCount = (res.apps || []).length;
+      const set = (id, v) => document.getElementById(id)?.classList.toggle('active', v);
+      set('sbProgOn', !!res.enabled);
+      host.innerHTML = '';
+      (res.apps || []).forEach(a => host.appendChild(this._progRow(a)));
+      if (!(res.apps || []).length) this._addProgramRow({});
+      const st = document.getElementById('sbProgStatus');
+      if (st) st.textContent = this._progSummary(res);
+      const note = document.getElementById('sbProgNote');
+      if (note) note.textContent = res.notes || '';
+    } catch (err) {
+      const st = document.getElementById('sbProgStatus');
+      if (st) st.textContent = `Could not read the program list: ${err.message}`;
+    }
+  }
+
+  /** One line saying whether this list would actually work. */
+  _progSummary(res) {
+    const apps = res.apps || [];
+    if (!res.enabled) return `Off - ${apps.length} program(s) configured, and agents cannot open any of them.`;
+    if (!apps.length) return 'On, but nothing is configured yet, so an agent has nothing to open.';
+    const bad = apps.filter(a => a.error);
+    if (bad.length) {
+      return `${apps.length} program(s). Not usable: ` + bad.map(a => `${a.name} (${a.error})`).join('; ');
+    }
+    const running = apps.filter(a => (a.running || []).length).length;
+    return `${apps.length} program(s), all usable${running ? `, ${running} running now` : ''}.`;
+  }
+
+  /** One editable launcher row. The name is what a model types, so it matters. */
+  _progRow(p = {}) {
+    const row = document.createElement('div');
+    row.dataset.prog = '1';
+    row.style.cssText = 'margin-top:8px';
+    const win = this._progPlatform === 'windows';
+    const pathHint = win ? 'C:/Windows/System32/notepad.exe'
+      : '/usr/bin/gedit';
+    row.innerHTML = `
+      <input class="form-input prog-name" maxlength="40" spellcheck="false"
+        placeholder="name the agent types" value="${esc(p.name || '')}">
+      <input class="form-input prog-path" spellcheck="false" style="margin-top:6px"
+        placeholder="full path, e.g. ${esc(pathHint)}" value="${esc(p.path || '')}">
+      <textarea class="form-textarea prog-args" rows="2" spellcheck="false" style="margin-top:6px"
+        placeholder="arguments, one per line (optional)">${esc((p.args || []).join('\n'))}</textarea>
+      <div class="form-hint prog-verdict" style="margin:4px 0 0"></div>
+      <button type="button" class="btn btn-ghost prog-del" style="margin-top:6px">REMOVE</button>
+    `;
+    const verdict = row.querySelector('.prog-verdict');
+    if (p.error) verdict.textContent = `Not usable: ${p.error}`;
+    else if ((p.running || []).length) verdict.textContent = `Running now (pid ${p.running.join(', ')}).`;
+    else if (p.resolved) verdict.textContent = `Ready - ${p.resolved}`;
+    else verdict.textContent = 'Not saved yet - press VERIFY & SAVE.';
+    row.querySelector('.prog-del').addEventListener('click', () => row.remove());
+    return row;
+  }
+
+  _addProgramRow(p = {}) {
+    const host = document.getElementById('sbProgList');
+    if (host) host.appendChild(this._progRow(p));
+  }
+
+  /**
+   * Save the launcher list, then read it back and report what the server kept.
+   *
+   * The read-back is the point: the server drops a row with an unusable name and
+   * refuses a path it cannot resolve or a .bat/.cmd target, so "saved" and "will
+   * actually open" are different claims. Reporting only the first is how the MCP
+   * card used to say Saved 6 when nothing was reachable.
+   */
+  async _savePrograms(opts = {}) {
+    const host = document.getElementById('sbProgList');
+    const st = document.getElementById('sbProgStatus');
+    const on = document.getElementById('sbProgOn')?.classList.contains('active');
+    const rows = host ? Array.from(host.querySelectorAll('[data-prog]')) : [];
+    const typed = rows.map((r) => {
+      const name = (r.querySelector('.prog-name')?.value || '').trim();
+      const path = (r.querySelector('.prog-path')?.value || '').trim();
+      const args = (r.querySelector('.prog-args')?.value || '')
+        .split('\n').map(s => s.trim()).filter(Boolean);
+      return { name, path, args };
+    }).filter(p => p.name || p.path);
+
+    const half = typed.filter(p => !p.name || !p.path);
+    if (half.length) {
+      if (st) st.textContent = `Not saved: ${half.length} row(s) need both a name and a path.`;
+      return;
+    }
+
+    try {
+      await this._patchServerConfig((cfg) => {
+        cfg.sandbox = cfg.sandbox || {};
+        cfg.sandbox.programs_enabled = !!on;
+        if (typed.length) cfg.sandbox.programs = typed;
+        else delete cfg.sandbox.programs;
+      });
+      await this._loadPrograms();
+      const kept = this._progCount || 0;
+      const dropped = typed.length - kept;
+      const line = document.getElementById('sbProgStatus');
+      if (dropped > 0 && line) {
+        line.textContent += ` ${dropped} row(s) were dropped: a name must start with a letter or digit `
+          + 'and hold only letters, digits, spaces, dot, dash or underscore.';
+      }
+      if (!opts.settingsOnly) {
+        store.emit('toast', {
+          message: dropped > 0 ? `Programs saved - ${dropped} row(s) dropped` : 'Programs saved',
+          type: dropped > 0 ? 'error' : 'success',
+        });
+      }
+    } catch (err) {
+      if (st) st.textContent = `Not saved: ${err.message}`;
+      store.emit('toast', { message: `Programs not saved: ${err.message}`, type: 'error' });
+    }
+  }
+
+  /** Surface any command that is waiting on the operator. */
+  async _pollApprovals() {
+    if (this._approvalTimer) clearInterval(this._approvalTimer);
+    this._approvalTimer = setInterval(async () => {
+      if (this.activeTab !== 'config') return;
+      try {
+        const res = await api.execPending();
+        const list = res.pending || [];
+        this._lastApprovals = list;
+        if (list.length === this._shownApprovals) return;
+        this._shownApprovals = list.length;
+        this._renderApprovals(list);
+      } catch { /* the tab may be gone */ }
+    }, 4000);
+    this._pollApprovalsOnce = () => this._pollApprovals();
+  }
+
+  _renderApprovals(list) {
+    const host = document.getElementById('sbExecStatus');
+    if (!host) return;
+    host.innerHTML = '';
+    if (!list.length) {
+      host.textContent = document.getElementById('sbExecOn')
+        ?.classList.contains('active') ? 'No commands waiting for approval.' : '';
+      return;
+    }
+    // Collapsed by default: a count, not a wall of commands. Approvals pop up
+    // wherever the operator is looking now, so this list is the review trail,
+    // not something that has to be stared at.
+    const n = list.length;
+    const toggle = document.createElement('button');
+    toggle.className = 'btn btn-ghost btn-block';
+    toggle.textContent = this._approvalsExpanded
+      ? `Hide ${n} waiting command${n === 1 ? '' : 's'}`
+      : `${n} command${n === 1 ? '' : 's'} waiting for approval — review`;
+    toggle.addEventListener('click', () => {
+      this._approvalsExpanded = !this._approvalsExpanded;
+      this._renderApprovals(this._lastApprovals || []);
+    });
+    host.appendChild(toggle);
+    if (!this._approvalsExpanded) return;
+    list.forEach(p => {
+      const row = document.createElement('div');
+      row.className = 'exec-approval';
+      const cmd = (p.argv || []).join(' ');
+      row.innerHTML = `<div class="exec-approval-cmd"></div><div class="exec-approval-who"></div>`;
+      row.querySelector('.exec-approval-cmd').textContent = cmd;
+      row.querySelector('.exec-approval-who').textContent =
+        (p.agent ? p.agent + ' wants to run' : 'A command is waiting') + (p.cwd ? ' in ' + p.cwd : '');
+      const bar = document.createElement('div');
+      bar.className = 'exec-approval-btns';
+      [['Allow once', 'once'], ['Always allow', 'always'], ['Deny + block', 'deny']].forEach(([label, decision]) => {
+        const b = document.createElement('button');
+        b.className = 'btn btn-sm ' + (decision === 'deny' ? 'btn-ghost' : 'btn-primary');
+        b.textContent = label;
+        b.addEventListener('click', async () => {
+          try {
+            const res = await api.execDecide(p.id, decision);
+            if (decision === 'deny') {
+              const name = (res && res.denied) || String((p.argv || [])[0] || cmd).split(' ')[0];
+              store.emit('toast', { message: `Denied and blocked "${name}" — remove it under Config → Allow/Deny list to undo.`, type: 'info' });
+            } else {
+              store.emit('toast', { message: `Command allowed: ${cmd.slice(0, 60)}`, type: 'info' });
+            }
+            this._lastApprovals = (this._lastApprovals || []).filter(x => x.id !== p.id);
+            this._shownApprovals = this._lastApprovals.length;
+            this._renderApprovals(this._lastApprovals);
+          } catch (err) {
+            store.emit('toast', { message: err.message, type: 'error' });
+          }
+        });
+        bar.appendChild(b);
+      });
+      row.appendChild(bar);
+      host.appendChild(row);
+    });
+  }
+
+  /**
+   * Open the allow/deny editor.
+   *
+   * Two lists, because they are enforced in two different places and confusing
+   * them would be a security hole:
+   *   TOOLS   - a client-side gate. Hiding a tool stops the model being told it
+   *             exists, but the code is still in the page, so this is policy,
+   *             not a boundary.
+   *   COMMANDS - the server-side exec allowlist. This one IS enforced, because
+   *             a command outside it is refused before the process starts.
+   */
+  /**
+   * Open the allow/deny editor.
+   *
+   * THREE lists, because they are enforced in three different places and
+   * blurring them is what made this unusable:
+   *
+   *   1. TOOLS        client-side. A hidden tool is simply not offered to the
+   *                   model. The code is still in the page, so this is policy,
+   *                   not a boundary.
+   *   2. COMMANDS OK  server-side allowlist, checked against argv[0]. A miss
+   *                   can still be approved one command at a time.
+   *   3. COMMANDS NO  server-side denylist, checked FIRST and absolute. A hit
+   *                   can never be approved and no stale grant can revive it.
+   *
+   * The bug this replaces: the tool checkboxes were seeded from the COMMAND
+   * allowlist, comparing tool names ("exec", "grep_code") against program
+   * names ("grep", "curl"). Nothing matched, so every tool rendered unticked,
+   * and saving wrote every tool into denied_tools. It also meant typing a tool
+   * name into the command box looked like it granted the tool when it could
+   * never match anything.
+   */
+  async openPolicyEditor() {
+    document.getElementById('policyModal')?.remove();
+
+    const toolIds = Object.keys(TOOL_REGISTRY);
+    const modal = document.createElement('div');
+    modal.id = 'policyModal';
+    modal.className = 'modal-bg';
+    modal.innerHTML = `
+      <div class="modal" style="max-width:700px;width:94vw;max-height:92vh">
+        <div class="modal-head">
+          <span class="modal-title">Allow / Deny</span>
+          <button class="modal-x" id="policyClose">&times;</button>
+        </div>
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">1. Harness tools</label>
+            <div class="policy-hint warn">Enforced in the BROWSER. Un-ticking stops the model being
+              offered the tool and hides it from every agent's picker. It does not remove the code
+              from the page &mdash; someone with devtools can still call it directly. This is policy,
+              not a boundary.</div>
+            <div class="policy-tools" id="policyTools"><div class="form-hint">Loading&hellip;</div></div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">2. Shell commands allowed</label>
+            <div class="policy-hint">Enforced SERVER-SIDE against the program name (argv[0]).
+              Anything not listed is refused, or queued for your approval if
+              &ldquo;ask before running new commands&rdquo; is on. These are OS programs
+              (<code>grep</code>, <code>curl</code>) &mdash; <b>not</b> harness tool names.</div>
+            <textarea class="form-textarea" id="policyCommands" rows="5"
+              placeholder="one command per line, e.g.&#10;grep&#10;curl&#10;nmap"></textarea>
+            <div class="form-hint" id="policyAllowHint"></div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">3. Interpreters</label>
+            <div class="policy-hint">Pick a level per interpreter. All three are yours to change at
+              any time &mdash; nothing here is permanent, and clearing a row puts it straight back on
+              the denylist in section 4.</div>
+            <div class="policy-interpreters" id="policyInterps"></div>
+            <div class="policy-hint warn" id="policyInterpWarn"></div>
+          </div>
+
+          <div class="form-group">
+            <div class="form-label-row">
+              <span class="form-label">4. Shell commands denied</span>
+              <button class="btn btn-ghost btn-sm" id="policyDenyDefaults" type="button">Restore built-in defaults</button>
+            </div>
+            <div class="policy-hint ok">Enforced SERVER-SIDE, and checked <i>before</i> the
+              allowlist and before approvals &mdash; so a name here wins over both, and a past
+              &ldquo;Always allow&rdquo; cannot reach around it. It is <b>not</b> permanent: this
+              box <i>is</i> the list, so a line you delete here is an ordinary command again
+              (refused as &ldquo;not allowed&rdquo;, or queued for approval). Use it for
+              interpreters and destructive verbs.</div>
+            <textarea class="form-textarea" id="policyDeny" rows="5"
+              placeholder="one command per line, e.g.&#10;sh&#10;python3&#10;rm"></textarea>
+            <div class="form-hint" id="policyDenyHint"></div>
+          </div>
+        </div>
+        <div class="modal-actions">
+          <button class="btn btn-ghost" id="policyCancel">Cancel</button>
+          <button class="btn btn-primary" id="policySave">Save</button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    // .modal-bg is opacity:0 / pointer-events:none until it gets `open`.
+    modal.classList.add('open');
+
+    const close = () => modal.remove();
+    modal.querySelector('#policyClose').addEventListener('click', close);
+    modal.querySelector('#policyCancel').addEventListener('click', close);
+    modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+
+    const toolsBox = modal.querySelector('#policyTools');
+    const allowTa = modal.querySelector('#policyCommands');
+    const denyTa = modal.querySelector('#policyDeny');
+    const interpBox = modal.querySelector('#policyInterps');
+
+    // Interpreters known to this app. Each is opt-in individually; anything
+    // not ticked keeps the absolute denylist. Painted after the fetch below,
+    // because the current set is only known once it returns.
+    // Shells are here too. They were missing, which meant the only way to run
+    // a .sh script was to hand-edit config.json -- the server already handled
+    // them correctly (refusing -c and stdin), the UI just never offered them.
+    const KNOWN_INTERPRETERS = [
+      'bash', 'sh', 'zsh',
+      'python3', 'python',
+      'node', 'perl', 'php', 'ruby', 'lua',
+    ];
+    interpBox.innerHTML = '<div class="form-hint">Loading&hellip;</div>';
+    const allowHint = modal.querySelector('#policyAllowHint');
+    const denyHint = modal.querySelector('#policyDenyHint');
+
+    let info = { allow: [], deny: [], custom_allow: false, custom_deny: false };
+    try {
+      info = (await api.execAllowlist()) || info;
+    } catch {
+      toolsBox.innerHTML = '<div class="form-hint" style="color:var(--accent-red)">'
+        + 'Could not read the current policy. Close and try again &mdash; saving now would '
+        + 'mistakenly hide every tool.</div>';
+      return;
+    }
+
+    const optedScripts = Array.isArray(info.interpreters) ? info.interpreters : [];
+    const optedFull = Array.isArray(info.interpreters_full) ? info.interpreters_full : [];
+    const levelOf = n => optedFull.includes(n) ? 'full' : (optedScripts.includes(n) ? 'scripts' : 'off');
+    interpBox.innerHTML = KNOWN_INTERPRETERS.map(n => `
+      <div class="interp-row">
+        <span class="tool-name">${esc(n)}</span>
+        <select class="form-select interp-level" data-interp="${esc(n)}">
+          <option value="off"      ${levelOf(n) === 'off'      ? 'selected' : ''}>Blocked</option>
+          <option value="scripts" ${levelOf(n) === 'scripts' ? 'selected' : ''}>Scripts only</option>
+          <option value="full"    ${levelOf(n) === 'full'    ? 'selected' : ''}>Full access</option>
+        </select>
+        <span class="tool-desc" data-desc="${esc(n)}"></span>
+      </div>`).join('');
+
+    // Each level says plainly what it grants, so the choice is informed.
+    const LEVEL_TEXT = {
+      off: 'Refused. Cannot be approved.',
+      scripts: 'May run script files inside your allowed directories. Inline code (-c, -e, -r, stdin) is refused.',
+      full: 'May run anything, including -c inline code. This is equivalent to giving it a shell.',
+    };
+    const paintDescs = () => {
+      interpBox.querySelectorAll('[data-interp]').forEach(sel => {
+        const d = interpBox.querySelector(`[data-desc="${sel.dataset.interp}"]`);
+        if (d) d.textContent = LEVEL_TEXT[sel.value];
+      });
+      const warn = modal.querySelector('#policyInterpWarn');
+      const full = [...interpBox.querySelectorAll('[data-interp]')]
+        .filter(s => s.value === 'full').map(s => s.dataset.interp);
+      if (warn) {
+        warn.textContent = full.length
+          ? `${full.join(', ')} can execute arbitrary code as the web server user. `
+            + 'That includes reading any file that user can read. Fine if that is your call - '
+            + 'just know it is the same power as a shell.'
+          : '';
+        warn.style.display = full.length ? '' : 'none';
+      }
+    };
+    paintDescs();
+    interpBox.addEventListener('change', paintDescs);
+
+    // --- tools: seeded from the saved DENY list, not the command allowlist ---
+    let denied = [];
+    try {
+      const saved = store.get('settings.deniedTools');
+      if (Array.isArray(saved)) denied = saved;
+      else {
+        const cfg = await api.getConfig();
+        const d = cfg?.sandbox?.denied_tools;
+        if (Array.isArray(d)) denied = d;
+      }
+    } catch { /* fall back to nothing denied */ }
+
+    toolsBox.innerHTML = toolIds.map(id => {
+      const def = TOOL_REGISTRY[id] || {};
+      return `<label class="tool-option">
+        <input type="checkbox" value="${esc(id)}" ${denied.includes(id) ? '' : 'checked'}>
+        <span class="tool-name">${esc(id)}</span>
+        <span class="tool-desc">${esc(def.describe || '')}</span>
+      </label>`;
+    }).join('');
+
+    // --- commands ---
+    if (info.custom_allow && Array.isArray(info.allow)) {
+      allowTa.value = info.allow.join('\n');
+      allowHint.textContent = `Custom list active (${info.allow.length} commands). The built-in defaults are REPLACED, not extended.`;
+    } else {
+      allowHint.textContent = `Using the built-in default list (${(info.allow || []).length} commands). Anything you type here replaces it entirely.`;
+    }
+
+    // The denylist is the operator's, so the box always says how to take a name
+    // back off it. A refusal that reads "denied" with no visible undo path is
+    // what makes a list feel permanent, which it is not.
+    const parseList = ta => String(ta.value || '')
+      .split(/[\r\n,]+/).map(s => s.trim()).filter(Boolean);
+    const paintDenyHint = (custom) => {
+      const n = parseList(denyTa).length;
+      if (!n) {
+        denyHint.textContent = 'Empty box = the built-in denylist comes back on Save, so '
+          + 'clearing it does not deny nothing. For an empty deny list, set "exec_deny": [] '
+          + 'in storage/config.json.';
+        return;
+      }
+      denyHint.textContent = `${custom ? 'Custom' : 'Built-in'} denylist (${n} commands).`
+        + ' Delete a line and press Save to un-deny that program \u2014 it becomes an ordinary '
+        + 'command again, still subject to section 2 and to approvals.'
+        + (custom ? '' : ' Editing this box turns it into a custom list.');
+    };
+    // The built-in list is sent even when a custom one is active, so an operator
+    // who replaced the defaults can still see and restore what shipped instead
+    // of being stuck with a list they can no longer read.
+    const denyDefaultsBtn = modal.querySelector('#policyDenyDefaults');
+    if (Array.isArray(info.deny_defaults) && info.deny_defaults.length) {
+      denyDefaultsBtn.addEventListener('click', () => {
+        denyTa.value = info.deny_defaults.join('\n');
+        // Its own message rather than paintDenyHint + a suffix: "editing this
+        // box turns it into a custom list" directly above "loaded, press Save"
+        // reads like a warning about what the button just did.
+        denyHint.textContent = `Built-in defaults loaded (${info.deny_defaults.length}`
+          + ' commands) \u2014 press Save to apply. Lines you delete after that stay deleted.';
+      });
+    } else {
+      denyDefaultsBtn.remove();
+    }
+    denyTa.value = (info.deny || []).join('\n');
+    paintDenyHint(!!info.custom_deny);
+    denyTa.addEventListener('input', () => paintDenyHint(true));
+
+    // --- save ---
+    modal.querySelector('#policySave').addEventListener('click', async () => {
+      try {
+        const newDenied = [...toolsBox.querySelectorAll('input')]
+          .filter(i => !i.checked).map(i => i.value);
+        const allow = parseList(allowTa);
+        const deny = parseList(denyTa);
+        const level = n => (interpBox.querySelector(`[data-interp="${n}"]`) || {}).value || 'off';
+        const interps = KNOWN_INTERPRETERS.filter(n => level(n) === 'scripts');
+        const interpsFull = KNOWN_INTERPRETERS.filter(n => level(n) === 'full');
+
+        // Refuse a list that contradicts itself rather than silently letting the
+        // denylist win: the operator almost certainly did not mean it.
+        const clash = allow.filter(c => deny.includes(c) && !interps.includes(c));
+        if (clash.length) {
+          store.emit('toast', {
+            message: `${clash.join(', ')} ${clash.length > 1 ? 'are' : 'is'} on both lists. The denylist wins, so allowlisting it does nothing.`,
+            type: 'error',
+          });
+        }
+        // Flag entries that can never match, so an inert line does not sit
+        // there looking like it granted something.
+        const inert = allow.filter(c => TOOL_REGISTRY[c]);
+        if (inert.length) {
+          store.emit('toast', {
+            message: `${inert.join(', ')} ${inert.length > 1 ? 'are harness tools' : 'is a harness tool'}, not a program. It will never match a command - use section 1 for that.`,
+            type: 'error',
+          });
+        }
+
+        await this._patchServerConfig((cfg) => {
+          cfg.sandbox = cfg.sandbox || {};
+          cfg.sandbox.denied_tools = newDenied;
+          if (allow.length) cfg.sandbox.exec_allow = allow; else delete cfg.sandbox.exec_allow;
+          if (deny.length) cfg.sandbox.exec_deny = deny; else delete cfg.sandbox.exec_deny;
+          if (interps.length) cfg.sandbox.exec_interpreters = interps;
+          else delete cfg.sandbox.exec_interpreters;
+          if (interpsFull.length) cfg.sandbox.exec_interpreters_full = interpsFull;
+          else delete cfg.sandbox.exec_interpreters_full;
+        });
+
+        store.set('settings.deniedTools', newDenied);
+        persistence.set('settings', store.get('settings'));
+        store.emit('tools:policy', newDenied);
+        store.emit('toast', {
+          message: `Saved - ${newDenied.length} tool(s) hidden, ${allow.length} commands allowed, `
+            + `${deny.length} denied, ${interps.length + interpsFull.length} interpreter(s) enabled`,
+          type: 'success',
+        });
+        close();
+        this._loadPolicyHint();
+      } catch (err) {
+        store.emit('toast', { message: `Not saved: ${err.message}`, type: 'error' });
+      }
+    });
+  }
+
+  async _loadPolicyHint() {
+    const el = document.getElementById('sbPolicyHint');
+    if (!el) return;
+    try {
+      const info = await api.execAllowlist();
+      const saved = store.get('settings.deniedTools');
+      const hidden = Array.isArray(saved) ? saved.length : 0;
+      const nInt = (info.interpreters || []).length + (info.interpreters_full || []).length;
+      el.textContent = `Tools: ${hidden} hidden. Commands: ${(info.allow || []).length} allowed, `
+        + `${(info.deny || []).length} denied`
+        + (nInt ? `, ${nInt} interpreter(s) script-only` : '')
+        + `. Shell access is ${info.enabled ? 'ON' : 'off'}.`;
+    } catch {
+      el.textContent = '';
+    }
+  }
+
+  /**
+   * Config → Updates: fetch the published release and show what differs.
+   *
+   * The plan is kept on the instance (not in storage) so re-rendering the Config
+   * tab does not re-download tens of megabytes or hit GitHub again — and the
+   * two things that can write are separate, explicit buttons: INSTALL UPDATE
+   * (a whole staged release, rollback copy first) and FINISH THE UPDATE (the
+   * single rename an unfinished install is missing).
+   */
+  _initUpdates() {
+    const btn = document.getElementById('sbUpdateCheck');
+    const statusEl = document.getElementById('sbUpdateStatus');
+    if (!btn || !statusEl) return;
+
+    this._renderUpdatePlan();
+    this._paintPending();
+
+    // Adopt whatever is already staged from an earlier session.
+    if (!this._updateLoaded) {
+      this._updateLoaded = true;
+      api.updateStatus()
+        .then((s) => {
+          this._updatePlan = s?.plan || null;
+          this._installPre = s?.install || null;
+          // "This copy" is read live: a staged plan is a snapshot, and the
+          // version here moves every time the UI is bumped.
+          if (this._updatePlan && s?.currentVersion) {
+            this._updatePlan.currentVersion = s.currentVersion;
+          }
+          this._renderUpdatePlan();
+          this._paintInstall();
+          this._paintPending();
+        })
+        .catch(() => { /* offline is not an error worth a toast here */ });
+    }
+
+    // The startup toggle. Client-side on purpose: the BROWSER is what decides
+    // to ask at load, so the switch travels with the browser that loads the app.
+    //
+    // _initToggle is the shared helper, and it is used here rather than a
+    // hand-rolled click handler for one specific reason: it persists the
+    // settings blob. `store.set` alone updates memory and nothing else, so a
+    // switch wired with it alone flips, toasts, and is forgotten by the next
+    // load -- it looks saved and is not.
+    this._initToggle('sbUpdateAuto', (on) => {
+      store.set('settings.checkUpdatesOnStartup', on);
+      // Both directions stay available: off silences the load-time check only.
+      // CHECK NOW and DOWNLOAD UPDATE are never switched off, so nothing is
+      // lost — and the toggle is right here to put back.
+      store.emit('toast', {
+        message: on
+          ? 'Updates: the app will check for a newer release at every load'
+          : 'Updates: no check at load. CHECK NOW and DOWNLOAD UPDATE still work',
+        type: 'info',
+      });
+    });
+
+    // The last answer, shown without asking the operator to press anything.
+    // Only once per instance: the server caches, but there is no reason to
+    // re-request it every time the Config tab re-renders.
+    if (document.getElementById('sbUpdateSeen')) {
+      if (this._lastCheck) {
+        this._paintCheckLine();
+      } else if (!this._checkLoaded) {
+        this._checkLoaded = true;
+        this._refreshCheckLine(false);
+      }
+    }
+
+    const nowBtn = document.getElementById('sbUpdateNow');
+    if (nowBtn) {
+      nowBtn.addEventListener('click', async () => {
+        if (this._checkBusy) return;
+        this._checkBusy = true;
+        const was = nowBtn.textContent;
+        nowBtn.disabled = true;
+        nowBtn.textContent = 'CHECKING…';
+        try {
+          // force=true: a hand-pressed check must never return a cached answer.
+          await this._refreshCheckLine(true);
+        } finally {
+          this._checkBusy = false;
+          nowBtn.disabled = false;
+          nowBtn.textContent = was;
+        }
+      });
+    }
+
+    btn.addEventListener('click', async () => {
+      if (this._updateBusy) return;
+      this._updateBusy = true;
+      const was = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'DOWNLOADING…';
+      statusEl.textContent = 'Fetching the published archive and comparing it. This can take a minute on a slow link.';
+      try {
+        const plan = await api.updateDownload();
+        this._updatePlan = plan || null;
+        // Re-ask the server whether it can actually write over the app. It is
+        // a different question from "did the download work", and answering it
+        // here is what keeps INSTALL from failing halfway through.
+        this._installPre = (await api.updateStatus().catch(() => null))?.install || null;
+        this._renderUpdatePlan();
+        this._paintInstall();
+        this._paintPending();
+        const n = (plan?.counts?.new || 0) + (plan?.counts?.changed || 0);
+        // "this copy / published" rather than "vA → vB": the published number
+        // can be LOWER than this one, and an arrow then reads as an upgrade
+        // when the release would actually take the install backwards.
+        statusEl.textContent = `Compared this copy v${plan?.currentVersion?.label ?? '?'} `
+          + `with published v${plan?.targetVersion?.label ?? '?'} · ${n} file(s) differ. `
+          + 'Nothing has been changed.';
+        store.emit('toast', {
+          message: `Update downloaded and compared — ${n} file(s) differ`,
+          type: 'success',
+        });
+      } catch (err) {
+        statusEl.textContent = `Not downloaded: ${errText(err)}`;
+        store.emit('toast', { message: `Update download failed: ${errText(err)}`, type: 'error' });
+      } finally {
+        this._updateBusy = false;
+        btn.disabled = false;
+        btn.textContent = was;
+      }
+    });
+
+    // INSTALL — the only control in the app that replaces app files.
+    const installBtn = document.getElementById('sbUpdateInstall');
+    if (installBtn) {
+      installBtn.addEventListener('click', async () => {
+        if (this._installBusy) return;
+        const target = this._updatePlan?.targetVersion?.label ?? '?';
+        if (!confirm(`Install v${target} now?\n\n`
+          + 'Every app file this release carries is replaced, including the page you are looking at.\n'
+          + 'A rollback copy goes to storage/backups first, and nothing under storage/ is touched,\n'
+          + 'so agents, sessions, models, keys and settings stay exactly as they are.\n\n'
+          + 'One reload afterwards.')) return;
+        this._installBusy = true;
+        const was = installBtn.textContent;
+        installBtn.disabled = true;
+        installBtn.textContent = 'INSTALLING…';
+        const hint = document.getElementById('sbUpdateInstallHint');
+        if (hint) hint.textContent = 'Writing files. Do not close this tab.';
+        try {
+          const res = await api.updateInstall();
+          this._updatePlan = null;
+          this._renderUpdatePlan();
+          this._installPre = (await api.updateStatus().catch(() => null))?.install || null;
+          this._paintInstall();
+          this._paintPending();
+          const done = document.getElementById('sbUpdateInstallHint');
+          if (done) {
+            done.textContent = `Installed ${res.installed} file(s) — this copy now reports v${res.to}. `
+              + (res.finishing
+                ? 'One file is still held open by the server; the installer finishes it a second '
+                  + 'from now. Reload once it has.'
+                : 'Reload the page to use it.');
+          }
+          store.emit('toast', { message: `Installed v${res.to} — reload to use it`, type: 'success' });
+        } catch (err) {
+          const fail = document.getElementById('sbUpdateInstallHint');
+          if (fail) {
+            fail.textContent = `Install failed: ${errText(err)}`;
+          }
+          store.emit('toast', { message: `Install failed: ${errText(err)}`, type: 'error' });
+        } finally {
+          this._installBusy = false;
+          installBtn.disabled = false;
+          installBtn.textContent = was;
+        }
+      });
+    }
+  }
+
+  /**
+   * Show INSTALL only when there is something to install and the server says it
+   * can write the app folder. A disabled button with the reason beside it beats
+   * a button that dies at file 200 of 388.
+   */
+  _paintInstall() {
+    const btn = document.getElementById('sbUpdateInstall');
+    if (!btn) return;
+    const hint = document.getElementById('sbUpdateInstallHint');
+    const roll = document.getElementById('sbUpdateRollback');
+    const plan = this._updatePlan;
+    const pre = this._installPre;
+    const work = !!plan && ((plan.counts?.new || 0) + (plan.counts?.changed || 0)) > 0;
+
+    btn.style.display = work ? 'block' : 'none';
+    btn.disabled = !!(pre && !pre.ok);
+
+    if (hint) {
+      if (!work) {
+        hint.textContent = '';
+      } else if (pre && !pre.ok) {
+        hint.textContent = (pre.problems || []).join(' ');
+      } else {
+        const from = plan.currentVersion?.label ?? '?';
+        const to = plan.targetVersion?.label ?? '?';
+        hint.textContent = `Replaces this copy's v${from} files with v${to}. A rollback copy is written first.`;
+      }
+    }
+    if (!roll) return;
+    const snaps = pre?.snapshots || [];
+    if (!snaps.length) {
+      roll.innerHTML = '';
+      return;
+    }
+    const newest = snaps[0];
+    const label = newest.version ? `v${newest.version}` : 'the last copy';
+    roll.innerHTML = `
+      <div class="form-hint">Rollback available: <code>${esc(newest.name)}</code>
+        (${label}, ${newest.files} files).</div>
+      <button class="btn btn-ghost btn-block" id="sbUpdateRollbackBtn">ROLL BACK TO ${esc(label.toUpperCase())}</button>`;
+    roll.querySelector('#sbUpdateRollbackBtn')?.addEventListener('click', async () => {
+      if (!confirm(`Restore ${newest.name}?\n\nEvery app file it holds is written back over this copy.\n`
+        + 'Nothing under storage/ is touched.')) return;
+      try {
+        const res = await api.updateRollback(newest.dir);
+        this._installPre = (await api.updateStatus().catch(() => null))?.install || null;
+        this._paintInstall();
+        this._paintPending();
+        store.emit('toast', { message: `Rolled back to ${res.to ? 'v' + res.to : 'the backup'} — reload`, type: 'success' });
+      } catch (e) {
+        store.emit('toast', { message: `Rollback failed: ${errText(e)}`, type: 'error' });
+      }
+    });
+  }
+
+  /**
+   * An install left one file behind: say so, and offer to finish it here.
+   *
+   * An installer cannot rename over the script that is running it — on Windows
+   * that is always api/index.php — so the new copy is written beside its target
+   * and a detached process swaps it in. Where the copy being replaced cannot
+   * find PHP (v354/v355 under XAMPP) that process never started, and until v357
+   * nothing retried: the panel said "up to date" and the swap waited for a
+   * command line. autoload.php retries it on every page load now, so this box
+   * only survives a load when the retry could not manage it either — which is
+   * exactly when a button is worth having.
+   */
+  _paintPending() {
+    const host = document.getElementById('sbUpdatePending');
+    if (!host) return;
+    const pending = this._installPre?.pending || [];
+
+    // The badge is the only signal while the section is collapsed, and the
+    // status fetch lands after the first paint — which built the header with no
+    // badge at all, because it did not know yet. So the span is created here
+    // when there is something to say, instead of only being re-labelled.
+    let badge = document.querySelector('[data-cfg-section="updates"] .cfg-section-badge');
+    if (!badge && pending.length) {
+      const head = document.querySelector('[data-cfg-section="updates"] .cfg-section-head');
+      if (head) {
+        badge = document.createElement('span');
+        badge.className = 'cfg-section-badge';
+        head.appendChild(badge);
+      }
+    }
+    if (badge) {
+      if (pending.length) {
+        badge.textContent = 'UNFINISHED';
+        badge.classList.remove('warn', 'ok');
+        badge.classList.add('danger');
+      } else {
+        badge.classList.remove('danger');
+        if (this._updatePlan) {
+          badge.textContent = `PUBLISHED v${this._updatePlan.targetVersion?.label || '?'}`;
+          badge.classList.add('warn');
+        } else if (badge.textContent === 'UNFINISHED') {
+          // A session that only knew about the waiting file has no plan to go
+          // back to, and an empty pill left behind would claim nothing at all.
+          // The header it was built into had no badge either, so remove it.
+          badge.remove();
+        }
+      }
+    }
+
+    if (!pending.length) {
+      host.innerHTML = '';
+      return;
+    }
+
+    const files = pending.map((f) => `<code>${esc(f)}</code>`).join(', ');
+    host.innerHTML = `
+      <div class="cfg-alert">
+        <div class="cfg-alert-title">${pending.length} file${pending.length === 1 ? '' : 's'} waiting — this update is unfinished</div>
+        <div class="form-hint" style="margin:0">
+          The installer cannot replace a file the server is running, so ${files}
+          ${pending.length === 1 ? 'is' : 'are'} written and waiting for one rename. Every page
+          load retries it; this does it now.
+        </div>
+        <button class="btn btn-primary btn-block" id="sbUpdateFinish" style="margin-top:8px">FINISH THE UPDATE</button>
+        <div class="form-hint" id="sbUpdateFinishHint"></div>
+      </div>`;
+
+    const btn = host.querySelector('#sbUpdateFinish');
+    btn?.addEventListener('click', async () => {
+      if (this._finishBusy) return;
+      this._finishBusy = true;
+      btn.disabled = true;
+      const was = btn.textContent;
+      btn.textContent = 'FINISHING…';
+      try {
+        const res = await api.updateFinish();
+        const swapped = res?.swapped || [];
+        const still = res?.pending || [];
+        // Re-read the state before repainting: the answer to "what is still
+        // waiting" is the server's, not this function's.
+        this._installPre = (await api.updateStatus().catch(() => null))?.install || null;
+        this._paintInstall();
+        this._paintPending();
+        if (swapped.length) {
+          store.emit('toast', {
+            message: `Update finished — ${swapped.join(', ')} swapped in`,
+            type: 'success',
+          });
+          return;
+        }
+        const left = document.getElementById('sbUpdateFinishHint');
+        if (!left) return;
+        if (!still.length) {
+          left.textContent = 'Nothing was left waiting. Reloading…';
+          setTimeout(() => location.reload(), 900);
+          return;
+        }
+        // The common case, and the one no request can win: the file still
+        // waiting is api/index.php, so THIS request is holding it — a rename
+        // from inside it fails for as long as it runs. The detached finisher
+        // is the process that can, and it starts as this request ends, so the
+        // honest thing is to say so and reload once rather than report a
+        // failure the user can do nothing about.
+        left.textContent = `The finisher takes over the moment this request ends — it is the process that can rename ${still.join(', ')}. Reloading… If this box is still here after that, run php install-update.php --finish.`;
+        setTimeout(() => location.reload(), 2200);
+      } catch (err) {
+        const msg = errText(err);
+        const left = document.getElementById('sbUpdateFinishHint');
+        if (left) {
+          // While api/index.php is the file still waiting, the OLD api answers
+          // these calls — and it may not have this route at all.
+          left.textContent = /404|not found/i.test(msg)
+            ? 'The running API is the older one and has no finish route yet. Reload the page: the new code retries the swap on load.'
+            : `Could not finish: ${msg} Run php install-update.php --finish.`;
+        }
+      } finally {
+        this._finishBusy = false;
+        // A successful finish replaces this node, so only restore a live one.
+        if (btn.isConnected) {
+          btn.disabled = false;
+          btn.textContent = was;
+        }
+      }
+    });
+  }
+
+  /**
+   * Paint the one-line answer of the load-time check.
+   *
+   * Every wording here is built from BOTH numbers, because either can be the
+   * larger one: this install can be ahead of the published release (it is,
+   * during development), and "v344 → v337" would then read as an upgrade when
+   * it is the opposite. `force` asks the server to skip its cache.
+   */
+  async _refreshCheckLine(force) {
+    const el = document.getElementById('sbUpdateSeen');
+    if (el) el.textContent = 'Checking…';
+    try {
+      const r = force ? await api.updateCheckNow() : await api.updateCheck();
+      this._lastCheck = r || null;
+    } catch (e) {
+      // Keep the failure on the instance too: re-rendering the tab should not
+      // make "could not reach GitHub" silently turn back into a blank line.
+      this._lastCheck = { ok: false, error: errText(e), localVersion: null };
+    }
+    this._paintCheckLine();
+  }
+
+  /**
+   * Draw the remembered check answer. Split from the request so a Config
+   * re-render repaints the line instead of paying for another round trip.
+   */
+  _paintCheckLine() {
+    const out = document.getElementById('sbUpdateSeen');
+    if (!out) return;
+    const r = this._lastCheck;
+    if (!r) {
+      out.textContent = '';
+      return;
+    }
+    const local = r.localVersion?.label ?? '?';
+    if (r.ok === false) {
+      out.textContent = `Could not check${r.error ? `: ${r.error}` : ''} — this copy is v${local}.`;
+      return;
+    }
+    const remote = String(r.remoteVersion?.label ?? '?');
+    const when = r.checkedAt ? new Date(r.checkedAt * 1000).toLocaleTimeString() : '';
+    const tail = `${when ? ` · checked ${when}` : ''}${r.cached ? ' (cached)' : ''}`;
+
+    // What shipped, from the top of the published CHANGELOG. Shown here as well
+    // as in the bell because a notification is raised ONCE per release and the
+    // bell list is in memory only -- reload the page and an announcement that
+    // lived only there is gone. This is where it can still be read later.
+    this._paintChangeNotes(r.updateAvailable ? r.remoteChange : null);
+    if (r.updateAvailable) {
+      out.textContent = `Update available: published v${remote}, this copy v${local}${tail}`;
+    } else if (Number(remote) < Number(local)) {
+      out.textContent = `Published v${remote}, this copy v${local} — this copy is the newer one${tail}`;
+    } else {
+      out.textContent = `Up to date at v${local}${tail}`;
+    }
+  }
+
+  /**
+   * "What's new" as a disclosure: one line closed, the whole entry open.
+   *
+   * A notification can only ever carry a sentence, and the entry behind it is a
+   * bullet list — so the row says what shipped and opens onto every line of it.
+   * The server sends the lines already split (`items`), each with its bold
+   * lead-in separated out, so this only has to place text; it never parses
+   * markdown and never assigns remote text to innerHTML.
+   *
+   * Open/closed is remembered on the instance because the Config tab is rebuilt
+   * from an HTML string: without it, any repaint — a CHECK NOW, a toggle — would
+   * slam the reader shut mid-sentence.
+   */
+  _paintChangeNotes(c) {
+    const host = document.getElementById('sbUpdateChange');
+    if (!host) return;
+    // Read the live state BEFORE replacing the node; a stale instance field
+    // would lose a click that happened since the last paint.
+    const live = host.querySelector('details');
+    if (live) this._changeOpen = live.open;
+    const opened = !!this._changeOpen;
+
+    host.innerHTML = '';
+    if (!c || !c.title) return;
+
+    const details = document.createElement('details');
+    details.className = 'change-notes';
+    details.open = opened;
+    details.addEventListener('toggle', () => { this._changeOpen = details.open; });
+
+    const head = document.createElement('summary');
+    head.className = 'change-notes-head';
+    const chev = document.createElement('span');
+    chev.className = 'cfg-chevron';
+    chev.textContent = '›';
+    const label = document.createElement('span');
+    label.className = 'change-notes-label';
+    label.textContent = `What's new:`;
+    const title = document.createElement('span');
+    title.className = 'change-notes-title';
+    title.textContent = c.title;
+    head.append(chev, label, title);
+
+    // The one-line summary while closed — and it lives INSIDE the <summary> on
+    // purpose. A closed <details> renders none of its other children, so the
+    // same text placed beside it disappeared exactly when it was the only thing
+    // worth reading. It hides once open, because the first line of `items` is
+    // that sentence without the trim: showing both would print it twice.
+    if (c.summary) {
+      const peek = document.createElement('span');
+      peek.className = 'change-notes-peek';
+      peek.textContent = c.summary;
+      head.append(peek);
+    }
+    details.append(head);
+
+    const items = Array.isArray(c.items) && c.items.length
+      ? c.items
+      : (c.summary ? [{ lead: '', body: c.summary, depth: 0 }] : []);
+    if (items.length) {
+      const body = document.createElement('div');
+      body.className = 'change-notes-body';
+      const list = document.createElement('ul');
+      for (const it of items) {
+        const li = document.createElement('li');
+        if (Number(it.depth) > 0) li.className = 'sub';
+        if (it.lead) {
+          const b = document.createElement('b');
+          b.textContent = it.lead;
+          li.append(b);
+          if (it.body) li.append(document.createTextNode(' '));
+        }
+        if (it.body) li.append(document.createTextNode(it.body));
+        list.append(li);
+      }
+      body.append(list);
+      if (c.truncated) {
+        const more = document.createElement('div');
+        more.className = 'change-notes-more';
+        more.textContent = '…the rest of this entry is not shown.';
+        body.append(more);
+      }
+      details.append(body);
+    }
+
+    host.append(details);
+  }
+
+  /** Paint the downloaded plan. Nothing here writes to disk. */
+  _renderUpdatePlan() {
+    const el = document.getElementById('sbUpdatePlan');
+    if (!el) return;
+    const p = this._updatePlan;
+    if (!p) { el.innerHTML = ''; return; }
+
+    const cur = p.currentVersion?.label ?? '?';
+    const next = p.targetVersion?.label ?? '?';
+    const c = p.counts || {};
+    const rows = (p.files || []).filter(f => f.status !== 'same');
+    const shown = rows.slice(0, 30);
+    const removed = (p.removed || []);
+    const mb = p.bytes ? `${(p.bytes / 1048576).toFixed(1)} MB` : '';
+    const size = f => (f.from == null ? `${f.to} B` : `${f.from} → ${f.to} B`);
+
+    // Keep the collapsed header honest: "PUBLISHED v337" is visible without
+    // opening the section, which is where a pending download is usually noticed.
+    const sec = el.closest('details.cfg-section');
+    if (sec) {
+      const head = sec.querySelector('.cfg-section-head');
+      let badge = head?.querySelector('.cfg-section-badge');
+      const label = p.targetVersion?.label;
+      if (label && head) {
+        if (!badge) {
+          badge = document.createElement('span');
+          badge.className = 'cfg-section-badge warn';
+          head.appendChild(badge);
+        }
+        badge.textContent = `PUBLISHED v${label}`;
+      } else if (badge) {
+        badge.remove();
+      }
+    }
+
+    el.innerHTML = `
+      <div class="policy-hint ok">
+        <b>Published v${esc(String(next))}</b> · this copy v${esc(String(cur))}
+        ${mb ? ` · ${esc(mb)} archive` : ''}
+        ${p.sha256 ? ` · sha256 ${esc(String(p.sha256).slice(0, 12))}…` : ''}
+      </div>
+      <div class="form-hint">
+        ${c.new || 0} new · ${c.changed || 0} changed · ${c.same || 0} unchanged ·
+        ${c.removed || 0} not in this release
+      </div>
+      ${rows.length ? `
+        <div class="form-hint" style="margin-top:6px">What would change:</div>
+        <div style="max-height:200px;overflow:auto;margin:4px 0">
+          ${shown.map(f => `<div class="form-hint" style="display:flex;gap:6px;align-items:baseline">
+            <span style="color:${f.status === 'new' ? 'var(--accent-green)' : 'var(--accent-orange)'}">${f.status === 'new' ? '+' : '~'}</span>
+            <span style="word-break:break-all;flex:1">${esc(f.path)}</span>
+            <span style="opacity:.7;white-space:nowrap">${esc(size(f))}</span>
+          </div>`).join('')}
+          ${rows.length > shown.length ? `<div class="form-hint">…and ${rows.length - shown.length} more</div>` : ''}
+        </div>` : '<div class="form-hint">No code differences — the published copy matches this one.</div>'}
+      ${removed.length ? `
+        <div class="form-hint" style="margin-top:6px">On disk but not in this release
+          (listed only — nothing is ever deleted):</div>
+        <div style="max-height:120px;overflow:auto;margin:4px 0">
+          ${removed.slice(0, 20).map(r => `<div class="form-hint" style="word-break:break-all">${esc(r)}</div>`).join('')}
+          ${removed.length > 20 ? `<div class="form-hint">…and ${removed.length - 20} more</div>` : ''}
+        </div>` : ''}
+      <div class="form-hint" style="margin-top:6px">
+        ${(p.notes || []).map(n => esc(n)).join('<br>')}
+      </div>
+      <button class="btn btn-ghost btn-block" id="sbUpdateDiscard" style="margin-top:8px">DISCARD THE DOWNLOAD</button>`;
+
+    el.querySelector('#sbUpdateDiscard')?.addEventListener('click', async () => {
+      try {
+        await api.updateDiscard();
+        this._updatePlan = null;
+        this._renderUpdatePlan();
+        const s = document.getElementById('sbUpdateStatus');
+        if (s) s.textContent = 'Discarded. storage/updates is empty again; nothing else was touched.';
+      } catch (e) {
+        store.emit('toast', { message: `Could not discard: ${errText(e)}`, type: 'error' });
+      }
+    });
+  }
+
+  /**
+   * Config → Labs: the Browser gate. It lives in the SERVER config (enforced
+   * with a 403 in the API), not in client settings — so it is read and written
+   * through /config like the other security-relevant switches.
+   */
+  _initBrowserToggle() {
+    const el = document.getElementById('sbBrowser');
+    if (!el) return;
+    el.addEventListener('click', async () => {
+      el.classList.toggle('active');
+      const on = el.classList.contains('active');
+      try {
+        await this._patchServerConfig((cfg) => { cfg.browser = { enabled: on }; });
+        resetBrowserEnabled();   // so the tool loop picks the change up at once
+        store.emit('toast', { message: on ? 'Browser enabled' : 'Browser disabled', type: on ? 'success' : 'info' });
+      } catch (e) {
+        el.classList.toggle('active');   // revert the visual on a failed save
+        store.emit('toast', { message: `Not saved: ${e.message}`, type: 'error' });
+      }
+    });
+    api.getConfig()
+      .then((cfg) => {
+        const on = !!(cfg && cfg.browser && cfg.browser.enabled);
+        document.getElementById('sbBrowser')?.classList.toggle('active', on);
+      })
+      .catch(() => { /* leave it as rendered */ });
+  }
+
+  /** Config → Labs: server OS + how much was detected. */
+  async _loadLabsStatus() {
+    const el = document.getElementById('sbLabsStatus');
+    if (!el) return;
+    try {
+      const s = await api.getSandboxStatus();
+      const os = s.os === 'windows' ? 'Windows' : 'POSIX (Linux/macOS)';
+      const bins = s.binaries || {};
+      const total = Object.keys(bins).length;
+      const have = Object.keys(bins).filter(k => bins[k]).length;
+      const memo = Object.keys((store.get('settings') || {}).toolDialectMap || {}).length;
+      el.textContent = `Server: ${os}. ${total ? `${have}/${total} allowlisted commands resolve. ` : ''}`
+        + `${memo} learned dialect${memo === 1 ? '' : 's'} remembered.`;
+    } catch {
+      el.textContent = '';
+    }
+  }
+
+  /**
+   * A 180° needle gauge (speedometer) built from one arc, tick marks and a CSS
+   * rotated needle — no chart library. `key` is 'Cpu' or 'Gpu'.
+   */
+  _dial(key, label, sub) {
+    const cx = 60, cy = 66, r = 46;
+    let ticks = '';
+    for (let i = 0; i <= 10; i++) {
+      const th = (-90 + i * 18) * Math.PI / 180;
+      const x1 = (cx + (r - 6) * Math.sin(th)).toFixed(1);
+      const y1 = (cy - (r - 6) * Math.cos(th)).toFixed(1);
+      const x2 = (cx + r * Math.sin(th)).toFixed(1);
+      const y2 = (cy - r * Math.cos(th)).toFixed(1);
+      ticks += `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}"/>`;
+    }
+    return `
+      <div class="rm-gauge">
+        <svg viewBox="0 0 120 74" class="rm-dial" aria-hidden="true">
+          <path d="M${cx - r} ${cy} A${r} ${r} 0 0 1 ${cx + r} ${cy}" class="rm-arc"/>
+          <g class="rm-ticks">${ticks}</g>
+          <line class="rm-needle" id="rmNeedle${key}" x1="${cx}" y1="${cy}" x2="${cx}" y2="${cy - (r - 4)}"/>
+          <circle cx="${cx}" cy="${cy}" r="3.4" class="rm-hub"/>
+        </svg>
+        <div class="rm-gauge-label">${label}</div>
+        <div class="rm-gauge-val" id="rmVal${key}">—</div>
+        <div class="rm-gauge-sub">${sub}</div>
+      </div>`;
+  }
+
+  _startGauges() {
+    if (this._gaugeTimer) return;
+    this._gaugeTimer = setInterval(() => this._updateGauges(), 500);
+    this._updateGauges();
+  }
+
+  _updateGauges() {
+    const cpuNeedle = document.getElementById('rmNeedleCpu');
+    const gpuNeedle = document.getElementById('rmNeedleGpu');
+    if (!cpuNeedle && !gpuNeedle) return;   // section collapsed / not on screen
+    const cpu = perf.cpu || 0;
+    this._setNeedle(cpuNeedle, 'rmValCpu', cpu, `${cpu}%`);
+    let pct, text;
+    if (perf.gpuOk && perf.gpu != null) {
+      pct = Math.min(100, (perf.gpu / 16.7) * 100);
+      text = `${perf.gpu.toFixed(1)} ms`;
+    } else {
+      pct = Math.min(100, ((perf.frameMs || 0) / 16.7) * 100);
+      text = `~${(perf.frameMs || 0).toFixed(1)} ms`;
+    }
+    this._setNeedle(gpuNeedle, 'rmValGpu', pct, text);
+    const ro = document.getElementById('sbRmReadout');
+    if (ro) {
+      ro.textContent = `${perf.fps || 0} fps · frame ~${perf.frameMs || 0} ms`
+        + (perf.gpuOk ? '' : ' · GPU is an estimate (this browser exposes no timer query)');
+    }
+  }
+
+  _setNeedle(needle, valId, pct, text) {
+    if (needle) {
+      const angle = -90 + (Math.max(0, Math.min(100, pct)) / 100) * 180;
+      needle.style.transform = `rotate(${angle.toFixed(1)}deg)`;
+    }
+    const v = document.getElementById(valId);
+    if (v) v.textContent = text;
+  }
+
+  _initToggle(id, callback) {    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('click', () => {
+      el.classList.toggle('active');
+      const on = el.classList.contains('active');
+      callback(on);
+      persistence.set('settings', store.get('settings'));
+    });
+  }
+
+  /** Live per-key usage for the governor block. Repainted on governor events
+   * while Config is open, so a saturated key is visible without polling. */
+  _renderGovStatus() {
+    const el = document.getElementById('sbGovStatus');
+    if (!el) return;
+    const on = (store.get('settings') || {}).rateLimitEnabled !== false;
+    if (!on) {
+      el.textContent = 'Limiter off. Calls go out unpaced.';
+      return;
+    }
+    let rows = [];
+    try {
+      rows = snapshot();
+    } catch {
+      rows = [];
+    }
+    if (!rows.length) {
+      el.textContent = 'No keys active in the last minute.';
+      return;
+    }
+    el.textContent = rows
+      .map(r => `${r.key}: ${r.used}/${r.rpm} this minute${r.waiting ? ` · ${r.waiting} waiting` : ''}`)
+      .join(' · ');
+  }
+
+  async loadSessions() {
+    try {
+      const sessions = await api.listSessions();
+      if (Array.isArray(sessions)) {
+        const convs = sessions.map(s => ({
+          id: s.id,
+          title: s.title,
+          createdAt: s.created_at,
+          updatedAt: s.last_activity,
+          active: s.active,
+          messages: this._convertDialogsToMessages(s.dialogs || []),
+          agentsUsed: s.models_used || [],
+        }));
+        store.set('conversations', convs);
+        persistence.set('conversations', convs);
+        if (this.activeTab === 'sessions') this.renderSessions();
+      }
+    } catch (err) {
+      console.error('Failed to load sessions:', err);
+    }
+  }
+}
+
+export default Sidebar;
