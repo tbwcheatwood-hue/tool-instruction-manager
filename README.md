@@ -2,6 +2,8 @@
 
 Tool & Instruction Manager. A task iteration mechanism.
 
+**Share / clone:** this repo is the T.I.M. mesh app only. [Autonomous Loop Studio (ALS)](https://github.com/MBHudson/Autonomous) is a separate install your friend downloads and points to from **Connect**. To publish this project on GitHub, see [docs/GITHUB-PUBLISH.md](docs/GITHUB-PUBLISH.md).
+
 T.I.M. is a local canvas for a mesh of agents. Agents, local models, MCP-style tools, and routers are nodes. Flow edges hand work onward. Brain edges attach a model. Tool edges attach a tool. The engine runs the graph and streams tokens, tool status, and hardware metrics back to the canvas.
 
 The interface is black, with lavender for the active path and olive for success and hardware.
