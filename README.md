@@ -1,125 +1,91 @@
-# Agent Routing Lab
+# T.I.M.
 
-A local visual workspace for connecting agents, tools, branches, and a reviewer, then running the graph. Day-to-day use of the canvas is in [USER-GUIDE.md](USER-GUIDE.md).
+Tool & Instruction Manager. A task iteration mechanism.
 
-The app is a Node.js project. In development it runs two processes: a Vite page on port 5173 and an API on port 8787. `npm run dev` starts both.
+T.I.M. is a local canvas for a mesh of agents. Agents, local models, MCP-style tools, and routers are nodes. Flow edges hand work onward. Brain edges attach a model. Tool edges attach a tool. The engine runs the graph and streams tokens, tool status, and hardware metrics back to the canvas.
 
-## Prerequisites
+The interface is black, with lavender for the active path and olive for success and hardware.
 
-- Ubuntu with a terminal and a web browser
-- Node.js 20 or newer, including npm (`node -v`)
-- Network access the first time, so `npm install` can download packages
+## Launch (T.I.M. + ALS)
 
-Ubuntu's default `node` may be too old. If `~/.local/node/bin/node` exists and is version 20 or newer, `Start.sh` uses it. Otherwise install a current Node.js and open a new terminal.
+Node.js 20+ and PHP 7.4+ are required. ALS lives at `~/Downloads/Autonomous-master` unless you change it in Connect.
 
-## First-time setup
-
-From this folder:
+**One command (recommended):**
 
 ```bash
-chmod +x Start.sh
+cd /home/livingroom/agent-routing-lab
 ./Start.sh
 ```
 
-The script installs dependencies when `node_modules` is missing, then starts the app and opens http://127.0.0.1:5173/ when a browser launcher is available.
+That starts **Autonomous Loop Studio** on http://127.0.0.1:8080/, the mesh engine on http://127.0.0.1:8791/, and the UI on http://127.0.0.1:3000/.
 
-You can also install by hand:
+**Open the app:** **http://127.0.0.1:3000/** — must be `http`, not `https`. If the browser says `ERR_SSL_PROTOCOL_ERROR`, you used https by mistake (see below).
+
+- **MESH** — flow canvas (agents, tools, Run).
+- **ALS** — Loop Studio embedded via same-origin proxy (`/als-studio` → port 8080).
+- **TAB** (next to MESH | ALS) — opens ALS in a separate browser tab if embed misbehaves.
+
+First visit to ALS may ask for an access token. It is in `~/Downloads/Autonomous-master/storage/config.json` under `sandbox.token`.
+
+If port **8080** is busy (old Desktop copy of the lab), stop that process and run `./Start.sh` again.
+
+**T.I.M. only** (ALS already running elsewhere):
 
 ```bash
-npm install
+npm install   # once
 npm run dev
 ```
 
-## Start
+`npm test` checks routing, ALS provider cleanup, and a scripted mesh run. `npm run typecheck` checks TypeScript.
 
-```bash
-./Start.sh
-```
+### `ERR_SSL_PROTOCOL_ERROR` on T.I.M.
 
-Or use the desktop shortcut after the install steps at the bottom of this file.
+T.I.M. and the dev server speak **plain HTTP** on port 3000. ALS on 8080 is the same. There is no TLS certificate.
 
-`Start.sh` also starts **Autonomous Loop Studio**, the PHP app in `autonomous/`, when `php` is on PATH. That is [MBHudson/Autonomous](https://github.com/MBHudson/Autonomous), copied in from the local `Autonomous-master` folder. Its own instructions are `autonomous/README.md`. The studio page is printed at startup, usually http://127.0.0.1:8080/. The lab page stays on http://127.0.0.1:5173/.
+- Use **http://127.0.0.1:3000/** (type `http://` or pick the bar’s non-https suggestion).
+- Do **not** open **https://127.0.0.1:3000** — that produces “invalid response” / `ERR_SSL_PROTOCOL_ERROR`.
+- If Chrome “always uses secure connections”, turn that off for this session or use Firefox, or clear HSTS for `127.0.0.1` via `chrome://net-internals/#hsts` (delete domain `127.0.0.1`).
+- In Cursor, prefer **Open in Browser** / an external browser with the `http://` link from the terminal after `./Start.sh`.
 
-## One workspace
+### ALS chat quirks
 
-The lab header has three views. They share the same provider list.
-
-| View | What it is |
+| Symptom | What to try |
 | --- | --- |
-| Workflow | The existing canvas. A tool set to `studio_relay` sends upstream text through the PHP studio's model relay. |
-| Chat | A conversation with the provider marked **Active**. A local base URL stays on this machine. Any other host is an external service. |
-| Loop Studio | The PHP app embedded in the page when it is answering. Autonomous loops, the studio's own routing chart, files, and approvals stay there. |
+| **Stream cut off** | Use **TAB** instead of the iframe; load the model in LM Studio; send a shorter message; hard-refresh ALS (`Ctrl+Shift+R`). |
+| **Blank bubble** | Hard-refresh after Connect → **Clean bogus providers** or **Register**; confirm the agent’s provider endpoint ends with `/v1/chat/completions` (not just `/v1`). |
 
-Save the studio address and access token in the Loop Studio view. The address must be `127.0.0.1` or `localhost`. The token is written to `data/studio.json` and is not returned by the API.
+**Connect** (left rail): scan LAN, set ALS paths, register verified endpoints into `storage/state.json`.
 
-Assumption: chat calls an OpenAI-compatible `/chat/completions` endpoint directly. Only the workflow tool `studio_relay` goes through the PHP relay, and only for a non-simulated provider. The PHP app is not rewritten into the lab.
+## LM Studio
 
-The studio needs PHP with curl:
+Start LM Studio’s local server at `http://127.0.0.1:1234`. The Models panel lists what that server reports, plus `.gguf` files under `~/.lmstudio/models`, `~/.cache/lm-studio/models`, and any directory you set.
 
-```bash
-sudo apt install php-cli php-curl php-mbstring php-zip
-```
+Load uses `lms load --gpu <fraction> --context-length <n>` when the `lms` CLI is on `PATH`. Otherwise it calls `POST /api/v1/models/load`. LM Studio’s REST loader does not take a layer count. The GPU slider is a percent of layers: `0` is off, `100` is max, and the REST fallback turns KV-cache GPU offload on whenever the value is above zero. CPU threads are sent with the REST load and stored on the node. The documented CLI loader does not accept a thread flag, so a CLI load keeps LM Studio’s own thread default.
 
-If PHP is missing, the routing lab still starts and the script says so. The first studio launch prints an access token. Paste it into **Config → Access token** in the studio. Ctrl+C in the `Start.sh` terminal stops the lab and the studio it started.
+Inference goes to `POST /v1/chat/completions` with temperature, top P, top K, and repeat penalty. Tokens per second and time to first token are measured from the stream. RAM comes from the operating system. VRAM and GPU utilization come from `nvidia-smi` when it is installed.
 
-## Stop
+If you set `LM_API_TOKEN`, it is sent as a bearer token and is not written to the database.
 
-Click the terminal window that is running the app and press Ctrl+C. Closing that terminal also stops it. If a previous copy is still running, `Start.sh` will not start a second one.
+## Tools
 
-## Desktop shortcut
+Tools run on this machine, inside the workspace shown in the Models panel. The default workspace is `data/workspace`.
 
-`agent-routing-lab.desktop` points at this folder:
-
-- command: `/home/livingroom/agent-routing-lab/Start.sh`
-- working directory: `/home/livingroom/agent-routing-lab`
-
-If you move the project, edit those two lines so they match the new location. The shortcut opens a terminal so you can read errors and press Ctrl+C to stop.
-
-Install it for your user:
-
-```bash
-chmod +x "/home/livingroom/agent-routing-lab/Start.sh"
-mkdir -p "$HOME/.local/share/applications" "$HOME/Desktop"
-cp "/home/livingroom/agent-routing-lab/agent-routing-lab.desktop" "$HOME/.local/share/applications/"
-cp "/home/livingroom/agent-routing-lab/agent-routing-lab.desktop" "$HOME/Desktop/"
-chmod +x "$HOME/.local/share/applications/agent-routing-lab.desktop" "$HOME/Desktop/agent-routing-lab.desktop"
-gio set "$HOME/Desktop/agent-routing-lab.desktop" metadata::trusted true
-update-desktop-database "$HOME/.local/share/applications" || true
-```
-
-`gio` is part of a normal Ubuntu desktop. If the Desktop icon still will not start, right-click it and choose Allow Launching.
-
-## Troubleshooting
-
-| What you see | What to do |
+| Tool | What it does |
 | --- | --- |
-| `Node.js 20 or newer is required` | Install Node 20+ or put a newer `node` first on `PATH`, then run `./Start.sh` again. |
-| `npm was not found` | Reinstall Node.js from a build that includes npm. |
-| `npm install failed` | Read the npm error. You need a network connection the first time. |
-| `already appears to be running` | Open http://127.0.0.1:5173/. Stop the old terminal with Ctrl+C if that page is stale. |
-| The page loads but the canvas stays empty or API calls fail | The UI expects the API on port 8787. Start with `./Start.sh` or `npm run dev`, not by opening `index.html` as a file. |
-| **Loop Studio** says it is not answering | Install PHP (the command above) and run `./Start.sh` again. The studio log is `data/autonomous.log`. Paste the first-run token into the Loop Studio view. |
-| Chat says the provider has no model or the endpoint failed | Open the provider, set a model id, and use **Test**. A local URL such as `http://127.0.0.1:11434/v1` needs that program running. An external URL sends the prompt off this machine. |
+| Filesystem | List, read, and write inside the workspace. Paths that leave the workspace are rejected. |
+| Workspace info | Reports workspace path, file count, and bytes. |
+| Bash | Runs under `/bin/bash` in the workspace after you approve the command. |
+| Git | `status`, `log`, or `diff` in the workspace. |
+| SQLite query | A single `SELECT` over the mesh memory database. |
+| Agent memory | Recent rows from the memories table. |
+| Web search | A DuckDuckGo instant answer (network). |
+| HTTP fetch | GET an http or https URL after approval (network, size-capped). |
+| MCP bridge | POST tool calls to an MCP bridge URL you set in Models (setup required). |
 
-## Security
+Bash defaults to requiring approval. Agents can also pause for a human note. Memory for agents that have Remember turned on is stored in `data/tim.sqlite`.
 
-- The lab and the studio listen on this machine only. Do not expose port 5173, 8787, or 8080 to the network.
-- Provider API keys live in `data/providers.json`. The studio token lives in `data/studio.json`. Neither is included in a workflow export.
-- The studio address is rejected unless it is loopback. The lab will not send a token or an API key to another host on your behalf through the studio relay.
-- Chat with an external provider sends the conversation to that host. The active pill names the host before you send.
-- Shell, files, and program launch stay inside Autonomous Loop Studio, behind its own access token and approval checks. The lab does not add a second way to run those tools.
-- The studio panel is a separate origin inside the page, so the lab page cannot read the studio's stored token.
-| Port already in use after a crash | Close the old process, or run `ss -ltnp | grep -E '5173|8787'` and stop the listed process. |
+## Canvas
 
-`npm test` runs the engine and API tests. `npm run build && npm start` builds the page and serves it from the API process only. The usual way to work on the app is `./Start.sh`.
+Drag a node from the left, or click it to drop one on the canvas. Connect the top handle of an agent to a local LLM for its brain, and the bottom handle to a tool. Flow moves from the right handle to the next node’s left handle. A router sends the message through the first outgoing handle whose match text appears in the upstream message. The remaining handle is the fallback.
 
-## What is real
-
-| Feature | State |
-| --- | --- |
-| Canvas, node settings, import/export, save/load | Working local UI |
-| Sequential and parallel execution, branches, local tools, artifacts, run history | Working |
-| Reviewer | Working rule check, not a model |
-| OpenAI-compatible `POST /chat/completions` | Real client. A live call happens only after you save an endpoint and run or test it |
-| Simulated provider | Labeled `[simulated]` and in the run banner |
-| Token streaming, loops, logins, external tools, a model acting as the reviewer | Not built |
+Save stores the graph. Run streams the active edge in lavender.

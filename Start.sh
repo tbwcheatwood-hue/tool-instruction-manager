@@ -1,12 +1,16 @@
 #!/usr/bin/env bash
-# Start Agent Routing Lab in development mode (API on port 8787, UI on port 5173).
+# Start T.I.M. + ALS together: Autonomous Loop Studio on 8080, mesh engine 8791, UI 3000.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
+ALS_ROOT="${ALS_ROOT:-$HOME/Downloads/Autonomous-master}"
+ALS_HOST="${ALS_HOST:-127.0.0.1}"
+ALS_PORT="${ALS_PORT:-8080}"
+
 die() {
-  echo "Agent Routing Lab: $*" >&2
+  echo "T.I.M.: $*" >&2
   exit 1
 }
 
@@ -48,135 +52,97 @@ pick_node() {
 port_open() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn | grep -q ":${port} " || return 1
-    return 0
+    ss -ltn | grep -q ":${port} " && return 0
+    return 1
   fi
   (echo >/dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
 }
 
-page_ok() {
-  "$NODE" -e "fetch('http://127.0.0.1:5173/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" >/dev/null 2>&1
+als_listen_pid() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep ":${ALS_PORT} " | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2
+  fi
 }
 
-open_browser() {
-  local url="http://127.0.0.1:5173/"
-  if command -v xdg-open >/dev/null 2>&1; then
-    xdg-open "$url" >/dev/null 2>&1 && return 0
-  fi
-  if command -v gio >/dev/null 2>&1; then
-    gio open "$url" >/dev/null 2>&1 && return 0
-  fi
-  echo "Open ${url} in a browser."
-  return 1
+als_pid_is_ours() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] || return 1
+  local args
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  [[ "$args" == *"${ALS_ROOT}/serve.php"* || "$args" == *"serve.php"* && "$args" == *"${ALS_ROOT}"* ]]
 }
 
-NODE="$(pick_node)" || die "Node.js 20 or newer is required. The node command on PATH is too old or missing. Install Node 20+ and run this script again. On this machine, Node 22 may already be at ~/.local/node if that directory exists."
+NODE="$(pick_node)" || die "Node.js 20 or newer is required."
 export PATH="$(dirname "$NODE"):$PATH"
 
-command -v npm >/dev/null 2>&1 || die "npm was not found next to ${NODE}. Install Node.js 20 or newer, which includes npm."
-[[ -f package.json ]] || die "package.json was not found in ${ROOT}."
+command -v npm >/dev/null 2>&1 || die "npm was not found next to ${NODE}."
+command -v php >/dev/null 2>&1 || die "php is required for ALS (${ALS_ROOT})."
 
-if [[ ! -x node_modules/.bin/vite || ! -x node_modules/.bin/tsx ]]; then
-  echo "Installing dependencies (first launch)..."
-  npm install || die "npm install failed. Check the messages above, then run ./Start.sh again."
+[[ -d "$ALS_ROOT" ]] || die "ALS root not found: ${ALS_ROOT} (set ALS_ROOT if installed elsewhere)."
+
+if [[ ! -d node_modules/next || ! -d node_modules/tsx ]]; then
+  echo "Installing dependencies..."
+  npm install
 fi
 
-STUDIO_PID=""
+if ! php "$ALS_ROOT/serve.php" --check >/dev/null 2>&1; then
+  die "ALS check failed in ${ALS_ROOT}. Run: php ${ALS_ROOT}/serve.php --setup"
+fi
+
+if ! php "$ALS_ROOT/serve.php" --ensure-token 2>&1 | grep -q '^TOKEN=exists'; then
+  token_line="$(php "$ALS_ROOT/serve.php" --ensure-token 2>&1 | grep '^TOKEN=' || true)"
+  if [[ "$token_line" == TOKEN=* && "$token_line" != TOKEN=exists ]]; then
+    echo "ALS access token was created. When ALS asks for it in the browser, paste the value from:"
+    echo "  ${ALS_ROOT}/storage/config.json  (sandbox.token)"
+  fi
+fi
+
+PHPINI=""
+if [[ -f "$ALS_ROOT/storage/php-runtime.ini" ]]; then
+  PHPINI="$ALS_ROOT/storage/php-runtime.ini"
+fi
+
+export ALS_ROOT
+
+ALS_PID=""
+if port_open "$ALS_PORT"; then
+  existing_pid="$(als_listen_pid || true)"
+  if als_pid_is_ours "$existing_pid"; then
+    echo "ALS already listening on ${ALS_HOST}:${ALS_PORT}"
+  else
+    die "Port ${ALS_PORT} is in use by another process (e.g. old Desktop Agent Routing Lab). Stop it, then run Start.sh again."
+  fi
+else
+  echo "Starting ALS on http://${ALS_HOST}:${ALS_PORT} ..."
+  if [[ -n "$PHPINI" ]]; then
+    php -c "$PHPINI" -S "${ALS_HOST}:${ALS_PORT}" -t "$ALS_ROOT" "$ALS_ROOT/serve.php" &
+  else
+    php -S "${ALS_HOST}:${ALS_PORT}" -t "$ALS_ROOT" "$ALS_ROOT/serve.php" &
+  fi
+  ALS_PID=$!
+  sleep 0.4
+  if ! port_open "$ALS_PORT"; then
+    die "ALS failed to bind ${ALS_HOST}:${ALS_PORT}"
+  fi
+fi
+
+if port_open 3000 || port_open 8791; then
+  [[ -n "$ALS_PID" ]] && kill "$ALS_PID" 2>/dev/null || true
+  die "Port 3000 or 8791 is already in use. Stop that process, then run Start.sh again."
+fi
+
 cleanup() {
-  if [[ -n "${STUDIO_PID}" ]]; then
-    kill "${STUDIO_PID}" 2>/dev/null || true
-    wait "${STUDIO_PID}" 2>/dev/null || true
+  if [[ -n "$ALS_PID" ]]; then
+    kill "$ALS_PID" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT INT TERM
 
-start_studio() {
-  local studio="$ROOT/autonomous"
-  if [[ ! -x "$studio/start.sh" ]]; then
-    echo "Autonomous Loop Studio was not found at autonomous/start.sh."
-    return 0
-  fi
-  if ! command -v php >/dev/null 2>&1; then
-    echo "Autonomous Loop Studio needs PHP with the curl extension."
-    echo "The routing lab will still start. Install PHP, then run ./Start.sh again:"
-    echo "  sudo apt install php-cli php-curl php-mbstring php-zip"
-    return 0
-  fi
-  mkdir -p "$ROOT/data"
-  if [[ -f "$ROOT/data/autonomous.url" ]]; then
-    local saved
-    saved="$(tr -d '[:space:]' < "$ROOT/data/autonomous.url")"
-    local saved_port="${saved##*:}"
-    saved_port="${saved_port%/}"
-    if [[ "$saved_port" =~ ^[0-9]+$ ]] && port_open "$saved_port"; then
-      echo "Autonomous Loop Studio already appears to be at ${saved}"
-      return 0
-    fi
-  fi
-  echo "Starting Autonomous Loop Studio from autonomous/"
-  : > "$ROOT/data/autonomous.log"
-  (
-    cd "$studio"
-    nohup ./start.sh 8080
-  ) >> "$ROOT/data/autonomous.log" 2>&1 &
-  STUDIO_PID=$!
-  local _
-  for _ in $(seq 1 50); do
-    if grep -q "Loop Studio at" "$ROOT/data/autonomous.log" 2>/dev/null; then
-      grep -oE 'http://127.0.0.1:[0-9]+/' "$ROOT/data/autonomous.log" | head -1 > "$ROOT/data/autonomous.url"
-      echo "Loop Studio: $(tr -d '[:space:]' < "$ROOT/data/autonomous.url")"
-      echo "First-run token, if one was created, is in the log below."
-      sed -n '1,40p' "$ROOT/data/autonomous.log"
-      return 0
-    fi
-    if ! kill -0 "$STUDIO_PID" 2>/dev/null; then
-      echo "Autonomous Loop Studio exited. See data/autonomous.log:"
-      sed -n '1,40p' "$ROOT/data/autonomous.log" || true
-      STUDIO_PID=""
-      return 0
-    fi
-    sleep 0.2
-  done
-  echo "Autonomous Loop Studio is still starting. See data/autonomous.log."
-}
+printf '\n'
+echo "T.I.M. (HTTP only — do not use https):"
+echo "  http://127.0.0.1:3000/"
+echo "ALS:"
+echo "  http://127.0.0.1:${ALS_PORT}/"
+printf '\n'
 
-start_studio
-
-if port_open 5173 || port_open 8787; then
-  if page_ok; then
-    echo "Agent Routing Lab is already running at http://127.0.0.1:5173/"
-    open_browser || true
-  else
-    echo "Port 5173 or 8787 is in use, but the lab page is not responding."
-    echo "Close the old terminal, or stop the program using that port, then run ./Start.sh again."
-    exit 1
-  fi
-  # This short run must not stop a studio it did not start in a previous terminal.
-  if [[ -n "${STUDIO_PID}" ]]; then
-    disown "${STUDIO_PID}" 2>/dev/null || true
-    STUDIO_PID=""
-  fi
-  exit 0
-fi
-
-echo "Starting Agent Routing Lab from ${ROOT}"
-echo "Interface: http://127.0.0.1:5173/"
-echo "API:       http://127.0.0.1:8787/"
-echo "Press Ctrl+C in this terminal to stop both servers."
-
-(
-  for _ in $(seq 1 60); do
-    if page_ok; then
-      open_browser || true
-      exit 0
-    fi
-    sleep 0.5
-  done
-  echo "The lab did not answer at http://127.0.0.1:5173/. See the messages above."
-) &
-
-set +e
 npm run dev
-code=$?
-set -e
-exit "$code"

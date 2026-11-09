@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=T.I.M.
+Comment=Tool & Instruction Manager
+Exec=/home/livingroom/agent-routing-lab/Start.sh
+Path=/home/livingroom/agent-routing-lab
+Terminal=true
+Type=Application
+Categories=Development;

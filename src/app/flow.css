@@ -1,0 +1,18 @@
+.react-flow,
+.react-flow__background,
+.react-flow__renderer,
+.react-flow__pane {
+  background: #000 !important;
+}
+
+.tim-als-shell {
+  isolation: isolate;
+  contain: layout paint size;
+}
+
+.tim-als-frame {
+  position: absolute;
+  left: 0;
+  top: 0;
+  max-width: none;
+}

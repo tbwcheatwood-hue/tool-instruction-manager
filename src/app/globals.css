@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+  --font-sans: "Ubuntu", "Segoe UI", sans-serif;
+  --font-mono: "Ubuntu Mono", "DejaVu Sans Mono", ui-monospace, monospace;
+}
+
+html,
+body {
+  height: 100%;
+  background: #000;
+}
+
+body {
+  margin: 0;
+}
+
+.react-flow {
+  background: #000;
+}
+
+.react-flow__handle {
+  width: 10px;
+  height: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.8);
+}
+
+.react-flow__controls {
+  overflow: hidden;
+  border: 1px solid rgba(196, 181, 253, 0.45);
+  border-radius: 2px;
+  box-shadow: none;
+}
+
+.react-flow__controls-button {
+  background: #000;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  fill: #ddd6fe;
+}
+
+.react-flow__controls-button:hover {
+  background: #09090b;
+}
+
+.react-flow__attribution {
+  background: transparent;
+  color: rgba(196, 181, 253, 0.55);
+}
+
+.react-flow__edge-path {
+  stroke-linecap: square;
+}
+
+.tim-range {
+  height: 2px;
+  appearance: none;
+  background: rgba(196, 181, 253, 0.45);
+  outline: none;
+}
+
+.tim-range::-webkit-slider-thumb {
+  width: 10px;
+  height: 10px;
+  appearance: none;
+  background: #c4b5fd;
+}
+
+@keyframes mesh-live {
+  50% {
+    box-shadow: 0 0 0 1px rgba(196, 181, 253, 0.9), 0 0 26px rgba(196, 181, 253, 0.28);
+  }
+}
+
+.mesh-live {
+  animation: mesh-live 1.6s ease-in-out infinite;
+}
+
+@keyframes tim-dash {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
