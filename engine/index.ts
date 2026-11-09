@@ -26,6 +26,11 @@ import { runMesh } from "./execute";
 import { readHardware } from "./hardware";
 import { listStudioModels, loadModel, streamChat, unloadModel, type StudioSettings } from "./lmstudio";
 import { runTool } from "./tools";
+import { parseWorkflowText } from "./workflow/parse";
+import { searchPublicWorkflows } from "./workflow/search";
+import { fetchAllowlistedRaw } from "./workflow/safeFetch";
+import type { ConverterId } from "./workflow/converters";
+import type { WorkflowSearchPlatform } from "../shared/workflowImport";
 
 const port = Number(process.env.TIM_PORT ?? 8791);
 const clients = new Set<WebSocket>();
@@ -240,6 +245,28 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
     if (flowMatch && req.method === "DELETE") {
       deleteFlow(decodeURIComponent(flowMatch[1]));
       reply(res, 200, { ok: true });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/workflows/import") {
+      const body = JSON.parse((await readBody(req)) || "{}") as { text?: string; source?: ConverterId | "auto" };
+      if (typeof body.text !== "string") throw new Error("POST JSON body.text (workflow file contents) is required.");
+      reply(res, 200, parseWorkflowText(body.text, body.source ?? "auto"));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/workflows/fetch") {
+      const body = JSON.parse((await readBody(req)) || "{}") as { rawUrl?: string; source?: ConverterId | "auto" };
+      if (typeof body.rawUrl !== "string") throw new Error("rawUrl is required.");
+      const text = await fetchAllowlistedRaw(body.rawUrl.trim());
+      reply(res, 200, parseWorkflowText(text, body.source ?? "auto"));
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/workflows/search") {
+      const body = JSON.parse((await readBody(req)) || "{}") as { platform?: WorkflowSearchPlatform; query?: string; limit?: number };
+      const platform = body.platform;
+      if (platform !== "langflow" && platform !== "flowise" && platform !== "n8n") {
+        throw new Error("platform must be langflow, flowise, or n8n.");
+      }
+      reply(res, 200, await searchPublicWorkflows(platform, String(body.query ?? ""), Number(body.limit ?? 12)));
       return;
     }
     reply(res, 404, { error: "Not found" });

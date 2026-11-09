@@ -87,14 +87,21 @@ function StudioInner() {
     return () => clearInterval(timer);
   }, [setHardware]);
 
-  const importFlow = (flow: FlowRecord) => {
+  const importFlow = (flow: FlowRecord, external?: import("../../../shared/workflowImport").ImportConversionResult) => {
     const state = useMesh.getState();
     if (state.isDirty()) {
       const ok = window.confirm("This mesh has unsaved changes. Import anyway and discard them?");
       if (!ok) return;
     }
     loadGraph(flow);
-    setNotice(`Imported ${flow.name}.`);
+    if (external?.summary?.length) {
+      const warnings = external.summary.filter((line) => line.severity !== "ok").length;
+      setNotice(
+        `Imported ${flow.name} from ${external.detectedSource} (${warnings} note${warnings === 1 ? "" : "s"}). Rewire brain/tool edges before Run.`,
+      );
+    } else {
+      setNotice(`Imported ${flow.name}.`);
+    }
   };
 
   const run = () => {

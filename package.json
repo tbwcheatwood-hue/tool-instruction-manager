@@ -9,7 +9,7 @@
     "dev": "concurrently -n engine,web -c green,magenta \"tsx watch --clear-screen=false engine/index.ts\" \"next dev -H 127.0.0.1 -p 3000\"",
     "build": "next build",
     "start": "concurrently -n engine,web \"tsx engine/index.ts\" \"next start -H 127.0.0.1 -p 3000\"",
-    "test": "tsx --test shared/mesh.test.ts engine/execute.test.ts engine/alsProviders.test.ts",
+    "test": "tsx --test shared/mesh.test.ts engine/execute.test.ts engine/alsProviders.test.ts engine/workflow/safeFetch.test.ts engine/workflow/converters/langflow.test.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

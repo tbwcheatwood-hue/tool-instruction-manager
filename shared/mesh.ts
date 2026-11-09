@@ -1,3 +1,5 @@
+import type { WorkflowImportMeta } from "./workflowImport";
+
 export type NodeKind = "agent" | "llm" | "tool" | "router";
 export type Relation = "flow" | "brain" | "tool";
 export type ToolServer =
@@ -85,6 +87,7 @@ export type GraphEdge = {
 export type Graph = {
   nodes: GraphNode[];
   edges: GraphEdge[];
+  meta?: WorkflowImportMeta;
 };
 
 export type FlowRecord = {
@@ -389,7 +392,7 @@ export function exampleGraph(): Graph {
   };
 }
 
-export function serializeGraph(nodes: GraphNode[], edges: GraphEdge[]): Graph {
+export function serializeGraph(nodes: GraphNode[], edges: GraphEdge[], meta?: Graph["meta"]): Graph {
   return {
     nodes: nodes.map(({ id: nodeId, type, position, data }) => ({ id: nodeId, type, position, data })),
     edges: edges.map((edge) => ({
@@ -401,6 +404,7 @@ export function serializeGraph(nodes: GraphNode[], edges: GraphEdge[]): Graph {
       type: edge.type ?? "mesh",
       data: { relation: relationOf(edge) },
     })),
+    ...(meta ? { meta } : {}),
   };
 }
 

@@ -58,6 +58,8 @@ T.I.M. and the dev server speak **plain HTTP** on port 3000. ALS on 8080 is the 
 
 **Connect** (left rail): scan LAN, set ALS paths, register verified endpoints into `storage/state.json`.
 
+**Import workflows** from Langflow, Flowise, or n8n (file upload or public GitHub search): see [docs/WORKFLOW-IMPORT.md](docs/WORKFLOW-IMPORT.md).
+
 ## LM Studio
 
 Start LM Studio’s local server at `http://127.0.0.1:1234`. The Models panel lists what that server reports, plus `.gguf` files under `~/.lmstudio/models`, `~/.cache/lm-studio/models`, and any directory you set.

@@ -1,0 +1,47 @@
+{
+  "name": "Minimal Langflow",
+  "description": "Fixture for import tests",
+  "data": {
+    "nodes": [
+      {
+        "id": "ChatInput-aa",
+        "type": "ChatInput",
+        "position": { "x": 0, "y": 0 },
+        "data": { "type": "ChatInput", "display_name": "Chat Input", "node": { "template": {} } }
+      },
+      {
+        "id": "OpenAIModel-bb",
+        "type": "OpenAIModel",
+        "position": { "x": 240, "y": 0 },
+        "data": {
+          "type": "OpenAIModel",
+          "display_name": "OpenAI",
+          "node": { "template": { "model_name": { "value": "gpt-4o-mini" } } }
+        }
+      },
+      {
+        "id": "ChatOutput-cc",
+        "type": "ChatOutput",
+        "position": { "x": 480, "y": 0 },
+        "data": { "type": "ChatOutput", "display_name": "Chat Output" }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "ChatInput-aa",
+        "target": "OpenAIModel-bb",
+        "sourceHandle": "message",
+        "targetHandle": "input_value"
+      },
+      {
+        "id": "e2",
+        "source": "OpenAIModel-bb",
+        "target": "ChatOutput-cc",
+        "sourceHandle": "text",
+        "targetHandle": "input_value"
+      }
+    ],
+    "viewport": { "x": 0, "y": 0, "zoom": 1 }
+  }
+}
