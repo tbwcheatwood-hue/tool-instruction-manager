@@ -8,46 +8,80 @@ T.I.M. is a local canvas for a mesh of agents. Agents, local models, MCP-style t
 
 The interface is black, with lavender for the active path and olive for success and hardware.
 
-## Launch (T.I.M. + ALS)
+## Launch (unified T.I.M. + ALS)
 
-Node.js 20+ and PHP 7.4+ are required. ALS lives at `~/Downloads/Autonomous-master` unless you change it in Connect.
+**Requirements:** Node.js 20+ (build + internal mesh engine), PHP 7.4+ with `curl`, and [Autonomous Loop Studio](https://github.com/MBHudson/Autonomous) on disk (`ALS_ROOT`, default `~/Downloads/Autonomous-master`).
 
-**One command (recommended):**
+### One command (recommended)
 
 ```bash
-cd /home/livingroom/agent-routing-lab
+cd agent-routing-lab
 ./Start.sh
 ```
 
-That starts **Autonomous Loop Studio** on http://127.0.0.1:8080/, the mesh engine on http://127.0.0.1:8791/, and the UI on http://127.0.0.1:3000/.
+This builds the static UI into `out/` (when missing), starts the **mesh engine** on loopback only, and serves everything from **one PHP process**:
 
-**Open the app:** **http://127.0.0.1:3000/** — must be `http`, not `https`. If the browser says `ERR_SSL_PROTOCOL_ERROR`, you used https by mistake (see below).
+| Port | Exposed? | Role |
+|------|----------|------|
+| **8070** (`TIM_HTTP_PORT`) | **Yes** — open this in the browser | T.I.M. UI, `/tim/*` REST proxy, `/tim/tools` (ALS is separate on **8888**) |
+| **8888** (`ALS_HTTP_PORT`) | **Yes** — Loop Studio | ALS `serve.php` from `ALS_ROOT` (started by `Start.sh` unless already running) |
+| **8791** (`TIM_ENGINE_PORT`) | Loopback only | Node mesh + WebSocket `/ws` (streaming runs, workflow import) |
+| **3000** | Not used in unified mode | Dev-only (`npm run dev`) |
 
-- **MESH** — flow canvas (agents, tools, Run).
-- **ALS** — Loop Studio embedded via same-origin proxy (`/als-studio` → port 8080).
-- **TAB** (next to MESH | ALS) — opens ALS in a separate browser tab if embed misbehaves.
+**Open:** **http://127.0.0.1:8070/** — must be `http`, not `https`. With [Project NOMAD](https://www.projectnomad.us/) on the same machine, reserve **8080** (Command Center) and **8090** (Kiwix).
 
-First visit to ALS may ask for an access token. It is in `~/Downloads/Autonomous-master/storage/config.json` under `sandbox.token`.
+- **MESH** — canvas; HTTP calls go to `/tim/...` on the same host; WebSocket uses `ws://127.0.0.1:8791/ws` (documented exception until SSE migration).
+- **ALS** — default **http://127.0.0.1:8888/** (embedded in the ALS tab via iframe; optional same-origin proxy at `/als-studio` if `alsApiUrl` matches T.I.M.’s port).
 
-If port **8080** is busy (old Desktop copy of the lab), stop that process and run `./Start.sh` again.
+First visit to ALS may ask for an access token (`storage/config.json` under your `ALS_ROOT`).
 
-**T.I.M. only** (ALS already running elsewhere):
+**Build the static UI manually:**
+
+```bash
+npm run build:consolidated
+```
+
+**Developer mode** (separate Next dev server + engine, hot reload):
 
 ```bash
 npm install   # once
 npm run dev
 ```
 
-`npm test` checks routing, ALS provider cleanup, and a scripted mesh run. `npm run typecheck` checks TypeScript.
+Then open http://127.0.0.1:3000/ with ALS at `ALS_API_URL` (default **8888**) or run `./Start.sh` to launch both.
 
-### `ERR_SSL_PROTOCOL_ERROR` on T.I.M.
+### Environment variables
 
-T.I.M. and the dev server speak **plain HTTP** on port 3000. ALS on 8080 is the same. There is no TLS certificate.
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ALS_ROOT` | `~/Downloads/Autonomous-master` | ALS install path |
+| `TIM_HTTP_PORT` | `8070` | T.I.M. PHP listen port |
+| `ALS_HTTP_PORT` | `8888` | Loop Studio listen port (`Start.sh` spawns ALS when free) |
+| `ALS_API_URL` | `http://127.0.0.1:8888` | Connect / engine default for ALS API |
+| `TIM_ENGINE_PORT` | `8791` | Loopback Node mesh port |
+| `TIM_WORKSPACE` | `data/workspace` | Jail for PHP local tools |
+| `FORCE_BUILD` | `0` | Set to `1` to rebuild `out/` on start |
+| `NODE_BIN` | (auto) | Node 20+ binary |
 
-- Use **http://127.0.0.1:3000/** (type `http://` or pick the bar’s non-https suggestion).
-- Do **not** open **https://127.0.0.1:3000** — that produces “invalid response” / `ERR_SSL_PROTOCOL_ERROR`.
-- If Chrome “always uses secure connections”, turn that off for this session or use Firefox, or clear HSTS for `127.0.0.1` via `chrome://net-internals/#hsts` (delete domain `127.0.0.1`).
-- In Cursor, prefer **Open in Browser** / an external browser with the `http://` link from the terminal after `./Start.sh`.
+`npm test` — mesh logic, ALS provider cleanup, workflow parsers.  
+`php tests/php/run.php` — unified router + PHP tool registry tests.
+
+### Local tool API (PHP)
+
+Discover and invoke allowlisted workspace tools (no arbitrary shell):
+
+- `GET /tim/tools` — registry
+- `POST /tim/tools/{id}/invoke` — body JSON args
+
+When `data/.tim-local-token` exists, send header `X-Tim-Token` with that value. Tools: `workspace_list`, `workspace_read`, `echo`.
+
+### Architecture note
+
+PHP does **not** replace the mesh engine or WebSocket layer. It consolidates the **browser entrypoint** and ALS co-hosting. Workflow import and LM Studio streaming during mesh runs remain on the internal Node process.
+
+### `ERR_SSL_PROTOCOL_ERROR`
+
+Use **http://** only. There is no TLS on the local servers.
 
 ### ALS chat quirks
 
@@ -59,6 +93,8 @@ T.I.M. and the dev server speak **plain HTTP** on port 3000. ALS on 8080 is the 
 **Connect** (left rail): scan LAN, set ALS paths, register verified endpoints into `storage/state.json`.
 
 **Import workflows** from Langflow, Flowise, or n8n (file upload or public GitHub search): see [docs/WORKFLOW-IMPORT.md](docs/WORKFLOW-IMPORT.md).
+
+**ALS routing charts:** export the mesh with **→ ALS** or import pipelines under **Import → ALS charts** — see [docs/TIM-ALS-ROUTING.md](docs/TIM-ALS-ROUTING.md).
 
 ## LM Studio
 

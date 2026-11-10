@@ -217,7 +217,7 @@ export function ConnectionsPanel() {
         <div className="border-t border-lavender/20 pt-3">
           <Label>ALS (Autonomous Loop Studio)</Label>
           <Input value={alsRoot} onChange={(e) => setAlsRoot(e.target.value)} className="mt-1 font-mono text-[10px]" placeholder="Path to Autonomous-master" />
-          <Input value={alsApiUrl} onChange={(e) => setAlsApiUrl(e.target.value)} className="mt-1 font-mono text-[10px]" placeholder="http://127.0.0.1:8080" />
+          <Input value={alsApiUrl} onChange={(e) => setAlsApiUrl(e.target.value)} className="mt-1 font-mono text-[10px]" placeholder="http://127.0.0.1:8888" />
           <Button variant="olive" className="mt-2 w-full" onClick={() => void registerAls()} disabled={busy}>
             Register verified endpoints
           </Button>

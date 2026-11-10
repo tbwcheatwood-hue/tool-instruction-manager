@@ -10,11 +10,13 @@ export function TopBar({
   onStop,
   onSave,
   onImport,
+  onExportAls,
 }: {
   onRun: () => void;
   onStop: () => void;
   onSave: () => void;
   onImport: () => void;
+  onExportAls: () => void;
 }) {
   const flowName = useMesh((state) => state.flowName);
   const setFlowName = useMesh((state) => state.setFlowName);
@@ -26,7 +28,7 @@ export function TopBar({
   const openPanel = useMesh((state) => state.openPanel);
   const studioView = useMesh((state) => state.studioView);
   const setStudioView = useMesh((state) => state.setStudioView);
-  const alsApiUrl = useMesh((state) => state.settings.alsApiUrl || "http://127.0.0.1:8080");
+  const alsApiUrl = useMesh((state) => state.settings.alsApiUrl || "http://127.0.0.1:8888");
   const isDirty = useMesh((state) => state.isDirty);
   const running = runStatus === "running";
   const vram = hardware?.vramUsedMb;
@@ -76,6 +78,9 @@ export function TopBar({
       <Input aria-label="Task" value={task} onChange={(event) => setTask(event.target.value)} className="min-w-[12rem] flex-1 border-lavender/30 text-zinc-100" placeholder="Task for the mesh" />
       <Button variant="outline" onClick={onImport} data-testid="import-flow">
         <FolderInput size={12} /> Import
+      </Button>
+      <Button variant="outline" onClick={onExportAls} data-testid="export-als">
+        → ALS
       </Button>
       <Button variant="outline" onClick={onSave} data-testid="save-flow">
         <Save size={12} /> Save

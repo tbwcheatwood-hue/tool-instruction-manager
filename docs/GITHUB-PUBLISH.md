@@ -40,7 +40,7 @@ cd tool-instruction-manager
 ./Start.sh
 ```
 
-**ALS is not in this repo.** They install [Autonomous Loop Studio](https://github.com/MBHudson/Autonomous) separately and point Connect at that folder (`alsRoot` / `http://127.0.0.1:8080`). LM Studio (or Ollama) is separate too.
+**ALS is not in this repo.** They install [Autonomous Loop Studio](https://github.com/MBHudson/Autonomous) separately and point Connect at that folder (`alsRoot` / `http://127.0.0.1:8888`). LM Studio (or Ollama) is separate too.
 
 ## What is not in git
 

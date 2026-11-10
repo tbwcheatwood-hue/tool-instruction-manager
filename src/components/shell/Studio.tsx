@@ -1,13 +1,15 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { HumanBar } from "@/components/shell/HumanBar";
+import { ExportAlsDialog } from "@/components/shell/ExportAlsDialog";
 import { ImportDialog } from "@/components/shell/ImportDialog";
 import { TopBar } from "@/components/shell/TopBar";
 import { AlsStudio } from "@/components/shell/AlsStudio";
 import { MeshWorkspace } from "@/components/shell/MeshWorkspace";
 import { Transcript } from "@/components/shell/Transcript";
 import { ENGINE_WS, engineFetch, type Settings } from "@/lib/engine";
+import type { AlsBridgeResult } from "../../../shared/alsRouting";
 import { createNode, serializeGraph, type FlowRecord } from "../../../shared/mesh";
 import { useMesh } from "@/store/mesh";
 
@@ -30,7 +32,12 @@ function StudioInner() {
   const answer = useMesh((state) => state.answer);
   const importOpen = useMesh((state) => state.importOpen);
   const setImportOpen = useMesh((state) => state.setImportOpen);
+  const setStudioView = useMesh((state) => state.setStudioView);
   const commitFingerprint = useMesh((state) => state.commitFingerprint);
+  const [exportAlsOpen, setExportAlsOpen] = useState(false);
+  const [exportAlsLoading, setExportAlsLoading] = useState(false);
+  const [exportAlsResult, setExportAlsResult] = useState<AlsBridgeResult | null>(null);
+  const [exportAlsError, setExportAlsError] = useState("");
 
   useEffect(() => {
     let socket: WebSocket | null = null;
@@ -137,6 +144,58 @@ function StudioInner() {
     }
   };
 
+  const beginExportAls = () => {
+    const state = useMesh.getState();
+    if (state.isDirty()) {
+      const ok = window.confirm("Unsaved mesh changes will be exported from the canvas (not the last save). Continue?");
+      if (!ok) return;
+    }
+    setExportAlsOpen(true);
+    setExportAlsResult(null);
+    setExportAlsError("");
+    setExportAlsLoading(true);
+    const { flowId, flowName, nodes, edges } = state;
+    void engineFetch<AlsBridgeResult>("/workflows/export-als", {
+      method: "POST",
+      body: JSON.stringify({
+        flowId,
+        name: flowName,
+        graph: serializeGraph(nodes, edges),
+        push: false,
+      }),
+    })
+      .then(setExportAlsResult)
+      .catch((cause: unknown) => setExportAlsError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setExportAlsLoading(false));
+  };
+
+  const pushExportAls = () => {
+    const state = useMesh.getState();
+    setExportAlsLoading(true);
+    const { flowId, flowName, nodes, edges } = state;
+    void engineFetch<AlsBridgeResult>("/workflows/export-als", {
+      method: "POST",
+      body: JSON.stringify({
+        flowId,
+        name: flowName,
+        graph: serializeGraph(nodes, edges),
+        push: true,
+        pipelineId: exportAlsResult?.pipelineId,
+      }),
+    })
+      .then((result) => {
+        setExportAlsResult(result);
+        const created = result.agentsTouched?.created.length ?? 0;
+        setNotice(
+          `Pushed "${result.name}" to ALS routing charts (${created} new agent${created === 1 ? "" : "s"}). Open ALS → Routing chart.`,
+        );
+        setStudioView("als");
+        setExportAlsOpen(false);
+      })
+      .catch((cause: unknown) => setExportAlsError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setExportAlsLoading(false));
+  };
+
   const fresh = () => {
     const agent = createNode("agent", { x: 80, y: 220 });
     const llm = createNode("llm", { x: 80, y: 40 });
@@ -164,8 +223,22 @@ function StudioInner() {
 
   return (
     <div className="flex h-[100dvh] flex-col overflow-hidden bg-black text-zinc-100">
-      <TopBar onRun={run} onStop={stop} onSave={() => void save()} onImport={() => setImportOpen(true)} />
+      <TopBar
+        onRun={run}
+        onStop={stop}
+        onSave={() => void save()}
+        onImport={() => setImportOpen(true)}
+        onExportAls={beginExportAls}
+      />
       <ImportDialog open={importOpen} onClose={() => setImportOpen(false)} onImport={importFlow} />
+      <ExportAlsDialog
+        open={exportAlsOpen}
+        loading={exportAlsLoading}
+        result={exportAlsResult}
+        error={exportAlsError}
+        onClose={() => setExportAlsOpen(false)}
+        onPush={pushExportAls}
+      />
       {notice && (
         <div className="border-b border-lavender/20 px-4 py-1 font-mono text-[11px] text-lavender" data-testid="notice">
           {notice}

@@ -45,7 +45,7 @@ export function AlsStudio() {
   }, [frameSrc]);
 
   const openTab = () => {
-    const direct = (alsApiUrl || "http://127.0.0.1:8080").replace(/\/$/, "");
+    const direct = (alsApiUrl || "http://127.0.0.1:8888").replace(/\/$/, "");
     window.open(direct, "_blank", "noopener,noreferrer");
   };
 

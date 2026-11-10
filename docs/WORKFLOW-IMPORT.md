@@ -2,6 +2,8 @@
 
 T.I.M. can import agent workflows from **Langflow**, **Flowise**, and **n8n** JSON exports. Conversion is **structural**, not semantic: components become mesh nodes and connections become **flow** edges. LLM/brain and tool edges are **not** inferred automatically.
 
+For **ALS routing charts** (bidirectional bridge with Autonomous Loop Studio), see [TIM-ALS-ROUTING.md](TIM-ALS-ROUTING.md) — separate from Langflow/Flowise/n8n converters.
+
 ## Import (UI)
 
 1. **Import** in the top bar → tab **File** → choose a `.json` export.

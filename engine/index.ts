@@ -31,8 +31,14 @@ import { searchPublicWorkflows } from "./workflow/search";
 import { fetchAllowlistedRaw } from "./workflow/safeFetch";
 import type { ConverterId } from "./workflow/converters";
 import type { WorkflowSearchPlatform } from "../shared/workflowImport";
+import type { AlsBridgeResult, AlsPipeline } from "../shared/alsRouting";
+import { ensureAgents, getAlsPipeline, listAlsPipelines, mergePipeline, readAlsState } from "./alsState";
+import { convertAlsPipelineToTim } from "./workflow/alsToTim";
+import { collectAgentDrafts, convertTimGraphToAls } from "./workflow/timToAls";
+import { DEFAULT_ALS_API_URL } from "../shared/alsPorts";
 
 const port = Number(process.env.TIM_PORT ?? 8791);
+const defaultAlsApiUrl = (process.env.ALS_API_URL || DEFAULT_ALS_API_URL).replace(/\/$/, "");
 const clients = new Set<WebSocket>();
 let active: { id: string; controller: AbortController } | null = null;
 const waiters = new Map<string, (value: WaitRequest) => void>();
@@ -104,8 +110,8 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
         modelsDir: settings.modelsDir,
         workspaceDir: settings.workspaceDir,
         mcpBridgeUrl: settings.mcpBridgeUrl,
-        alsRoot: getSetting("alsRoot", process.env.ALS_ROOT || "/home/livingroom/Downloads/Autonomous-master"),
-        alsApiUrl: getSetting("alsApiUrl", "http://127.0.0.1:8080"),
+        alsRoot: getSetting("alsRoot", process.env.ALS_ROOT || ""),
+        alsApiUrl: getSetting("alsApiUrl", defaultAlsApiUrl),
       });
       return;
     }
@@ -130,8 +136,8 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
         modelsDir: settings.modelsDir,
         workspaceDir: settings.workspaceDir,
         mcpBridgeUrl: settings.mcpBridgeUrl,
-        alsRoot: getSetting("alsRoot", "/home/livingroom/Downloads/Autonomous-master"),
-        alsApiUrl: getSetting("alsApiUrl", "http://127.0.0.1:8080"),
+        alsRoot: getSetting("alsRoot", process.env.ALS_ROOT || ""),
+        alsApiUrl: getSetting("alsApiUrl", defaultAlsApiUrl),
       });
       return;
     }
@@ -191,7 +197,7 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
       return;
     }
     if (req.method === "POST" && url.pathname === "/connections/als/cleanup") {
-      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "/home/livingroom/Downloads/Autonomous-master");
+      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "");
       reply(res, 200, cleanupAlsProviders(resolveAlsPaths(alsRoot)));
       return;
     }
@@ -201,7 +207,7 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
       const picks = body.serviceIndexes?.length
         ? body.serviceIndexes.map((index) => report.services[index]).filter(Boolean)
         : report.services.filter((s) => s.reachable);
-      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "/home/livingroom/Downloads/Autonomous-master");
+      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "");
       reply(res, 200, registerServicesInAls(resolveAlsPaths(alsRoot), picks));
       return;
     }
@@ -267,6 +273,97 @@ async function handleHttp(req: http.IncomingMessage, res: http.ServerResponse): 
         throw new Error("platform must be langflow, flowise, or n8n.");
       }
       reply(res, 200, await searchPublicWorkflows(platform, String(body.query ?? ""), Number(body.limit ?? 12)));
+      return;
+    }
+    if (req.method === "GET" && url.pathname === "/workflows/als-pipelines") {
+      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "");
+      const paths = resolveAlsPaths(alsRoot);
+      const { pipelines, error } = listAlsPipelines(paths);
+      if (error && pipelines.length === 0) {
+        reply(res, 400, { error });
+        return;
+      }
+      reply(res, 200, { pipelines, incomplete: error });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/workflows/export-als") {
+      const body = JSON.parse((await readBody(req)) || "{}") as {
+        flowId?: string;
+        graph?: Graph;
+        name?: string;
+        push?: boolean;
+        pipelineId?: string;
+      };
+      let graph = body.graph;
+      let name = body.name?.trim() || "T.I.M. mesh export";
+      if (body.flowId) {
+        const flow = getFlow(body.flowId);
+        if (!flow) throw new Error("Flow not found");
+        graph = flow.graph;
+        name = flow.name;
+      }
+      if (!graph) throw new Error("graph or flowId is required");
+      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "");
+      const paths = resolveAlsPaths(alsRoot);
+      const { state, error: stateError } = readAlsState(paths);
+      if (stateError && !state) throw new Error(stateError);
+
+      let agentsTouched: AlsBridgeResult["agentsTouched"];
+      const agents = Array.isArray(state?.slots?.agents) ? state!.slots!.agents! : [];
+      if (body.push) {
+        const drafts = collectAgentDrafts(graph);
+        const touch = ensureAgents(paths, drafts);
+        if (touch.error) throw new Error(touch.error);
+        agentsTouched = touch.touch;
+      }
+      const refreshed = readAlsState(paths).state;
+      const agentList = Array.isArray(refreshed?.slots?.agents) ? refreshed!.slots!.agents! : agents;
+      const result = convertTimGraphToAls(graph, name, agentList, body.pipelineId);
+      if (!result.ok || !result.pipeline) {
+        reply(res, 400, result);
+        return;
+      }
+      if (body.push) {
+        const mergeErr = mergePipeline(paths, result.pipeline, body.pipelineId);
+        if (mergeErr.error) throw new Error(mergeErr.error);
+      }
+      reply(res, 200, { ...result, agentsTouched });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/workflows/import-als") {
+      const body = JSON.parse((await readBody(req)) || "{}") as {
+        pipelineId?: string;
+        pipeline?: AlsPipeline;
+        pushFlow?: boolean;
+        flowName?: string;
+        flowId?: string;
+      };
+      const alsRoot = getSetting("alsRoot", process.env.ALS_ROOT || "");
+      const paths = resolveAlsPaths(alsRoot);
+      let pipeline = body.pipeline;
+      if (body.pipelineId) {
+        const loaded = getAlsPipeline(paths, body.pipelineId);
+        if (loaded.error || !loaded.pipeline) throw new Error(loaded.error || "Pipeline not found");
+        pipeline = loaded.pipeline;
+      }
+      if (!pipeline) throw new Error("pipelineId or pipeline is required");
+      const { state } = readAlsState(paths);
+      const agents = Array.isArray(state?.slots?.agents) ? state!.slots!.agents! : [];
+      const result = convertAlsPipelineToTim(pipeline, agents);
+      if (!result.ok || !result.graph) {
+        reply(res, 400, result);
+        return;
+      }
+      if (body.pushFlow) {
+        const saved = saveFlow(
+          body.flowId || crypto.randomUUID(),
+          body.flowName?.trim() || result.name,
+          result.graph,
+        );
+        reply(res, 200, { ...result, flowId: saved.id, saved: true });
+        return;
+      }
+      reply(res, 200, result);
       return;
     }
     reply(res, 404, { error: "Not found" });

@@ -17,6 +17,13 @@ test("normalizeChatEndpoint fixes bare /v1 OpenAI base URLs", () => {
   assert.equal(normalizeChatEndpoint("https://integrate.api.nvidia.com/v1"), "https://integrate.api.nvidia.com/v1/chat/completions");
 });
 
+test("normalizeChatEndpoint fixes Z.ai Standard paas v4 base URL", () => {
+  assert.equal(
+    normalizeChatEndpoint("https://api.z.ai/api/paas/v4"),
+    "https://api.z.ai/api/paas/v4/chat/completions",
+  );
+});
+
 test("cleanupAlsProviders repairs short /v1 endpoints and local auth", () => {
   const root = tmpAlsRoot();
   const paths = resolveAlsPaths(root);

@@ -5,10 +5,11 @@ import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { engineFetch, type FlowRecord } from "@/lib/engine";
+import type { AlsBridgeResult, AlsPipelineSummary } from "../../../shared/alsRouting";
 import type { ImportConversionResult, WorkflowSearchPlatform, WorkflowSearchResponse } from "../../../shared/workflowImport";
 import { useMesh } from "@/store/mesh";
 
-type Tab = "saved" | "file" | "discover";
+type Tab = "saved" | "file" | "discover" | "als";
 
 function formatWhen(iso: string): string {
   const date = new Date(iso);
@@ -43,6 +44,9 @@ export function ImportDialog({
   const [platform, setPlatform] = useState<WorkflowSearchPlatform>("langflow");
   const [searchQuery, setSearchQuery] = useState("RAG");
   const [search, setSearch] = useState<WorkflowSearchResponse | null>(null);
+  const [alsPipelines, setAlsPipelines] = useState<AlsPipelineSummary[]>([]);
+  const [alsSelected, setAlsSelected] = useState("");
+  const [alsBridge, setAlsBridge] = useState<AlsBridgeResult | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -51,6 +55,22 @@ export function ImportDialog({
     setError("");
     setConversion(null);
     setSearch(null);
+    if (tab === "als") {
+      setLoading(true);
+      setAlsBridge(null);
+      void engineFetch<{ pipelines: AlsPipelineSummary[]; incomplete?: string }>("/workflows/als-pipelines")
+        .then((res) => {
+          setAlsPipelines(res.pipelines);
+          setAlsSelected(res.pipelines[0]?.id || "");
+          if (res.incomplete) setError(res.incomplete);
+          setLoading(false);
+        })
+        .catch((cause: unknown) => {
+          setError(cause instanceof Error ? cause.message : String(cause));
+          setLoading(false);
+        });
+      return;
+    }
     if (tab !== "saved") return;
     setLoading(true);
     void engineFetch<{ id: string; name: string; updatedAt: string }[]>("/flows")
@@ -103,6 +123,7 @@ export function ImportDialog({
                 ["saved", "Saved"],
                 ["file", "File"],
                 ["discover", "Discover"],
+                ["als", "ALS charts"],
               ] as const
             ).map(([id, label]) => (
               <button
@@ -184,6 +205,66 @@ export function ImportDialog({
                 {loading ? <Loader2 className="animate-spin" size={14} /> : null}
                 Validate &amp; convert
               </Button>
+            </>
+          )}
+
+          {tab === "als" && (
+            <>
+              <p className="text-[11px] leading-relaxed text-zinc-400">
+                Pull a routing-chart workflow from ALS storage into the mesh canvas. Flow edges only — add brain/tool links before Run.
+              </p>
+              {loading && <p className="text-sm text-zinc-400">Loading ALS pipelines…</p>}
+              {!loading && alsPipelines.length === 0 && (
+                <p className="text-sm text-zinc-400">No pipelines in ALS state yet. Create one in ALS Routing chart first.</p>
+              )}
+              {!loading &&
+                alsPipelines.map((pipe) => (
+                  <button
+                    key={pipe.id}
+                    type="button"
+                    onClick={() => {
+                      setAlsSelected(pipe.id);
+                      setAlsBridge(null);
+                    }}
+                    className={`block w-full border px-3 py-2 text-left ${alsSelected === pipe.id ? "border-lavender bg-black" : "border-lavender/25 hover:border-lavender/50"}`}
+                  >
+                    <div className="font-medium">{pipe.name}</div>
+                    <div className="mt-0.5 font-mono text-[10px] text-zinc-500">{pipe.id}</div>
+                  </button>
+                ))}
+              <Button
+                variant="outline"
+                className="w-full"
+                disabled={!alsSelected || loading}
+                data-testid="als-pipeline-preview"
+                onClick={() => {
+                  if (!alsSelected) return;
+                  setLoading(true);
+                  void engineFetch<AlsBridgeResult>("/workflows/import-als", {
+                    method: "POST",
+                    body: JSON.stringify({ pipelineId: alsSelected }),
+                  })
+                    .then(setAlsBridge)
+                    .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : String(cause)))
+                    .finally(() => setLoading(false));
+                }}
+              >
+                Preview conversion
+              </Button>
+              {alsBridge && (
+                <div className="border border-lavender/25 p-2" data-testid="als-conversion-summary">
+                  <div className="font-mono text-[10px] text-lavender-bright">
+                    {alsBridge.ok ? "ALS → mesh preview" : "Conversion failed"}
+                  </div>
+                  <ul className="mt-2 max-h-32 space-y-0.5 overflow-y-auto font-mono text-[9px]">
+                    {alsBridge.summary.map((line, index) => (
+                      <li key={`${line.message}-${index}`} className={summaryTone(line.severity)}>
+                        [{line.severity}] {line.message}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </>
           )}
 
@@ -312,6 +393,33 @@ export function ImportDialog({
           )}
           {(tab === "file" || (tab === "discover" && conversion?.ok)) && (
             <Button disabled={!conversion?.ok} data-testid="confirm-external-import" onClick={applyConversion}>
+              Load on canvas
+            </Button>
+          )}
+          {tab === "als" && (
+            <Button
+              disabled={!alsBridge?.ok || !alsBridge.graph}
+              data-testid="confirm-als-import"
+              onClick={() => {
+                if (!alsBridge?.ok || !alsBridge.graph) return;
+                onImport(
+                  {
+                    id: crypto.randomUUID(),
+                    name: alsBridge.name,
+                    graph: alsBridge.graph,
+                    updatedAt: new Date().toISOString(),
+                  },
+                  {
+                    ok: true,
+                    name: alsBridge.name,
+                    graph: alsBridge.graph,
+                    summary: alsBridge.summary,
+                    detectedSource: "als",
+                  },
+                );
+                onClose();
+              }}
+            >
               Load on canvas
             </Button>
           )}

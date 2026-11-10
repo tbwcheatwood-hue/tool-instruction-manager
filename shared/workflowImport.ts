@@ -1,6 +1,6 @@
 import type { Graph, GraphEdge, GraphNode } from "./mesh";
 
-export type WorkflowPlatform = "langflow" | "flowise" | "n8n" | "tim" | "unknown";
+export type WorkflowPlatform = "langflow" | "flowise" | "n8n" | "tim" | "als" | "unknown";
 
 export type ConversionSeverity = "ok" | "warning" | "unsupported";
 

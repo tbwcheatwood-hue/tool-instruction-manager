@@ -40,6 +40,7 @@ export function normalizeChatEndpoint(endpoint: string): string {
   if (/\/api\/chat\/?$/i.test(raw)) return raw.replace(/\/$/, "");
   if (/\/chat\/completions\/?$/i.test(raw)) return raw.replace(/\/$/, "");
   const trimmed = raw.replace(/\/$/, "");
+  if (/\/paas\/v\d+$/i.test(trimmed)) return `${trimmed}/chat/completions`;
   if (/\/v1$/i.test(trimmed)) return `${trimmed}/chat/completions`;
   return trimmed;
 }
