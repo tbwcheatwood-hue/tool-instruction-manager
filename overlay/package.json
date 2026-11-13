@@ -1,0 +1,16 @@
+{
+  "name": "game-overlay",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Frameless transparent overlay for borderless-windowed games",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron . --no-sandbox"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.2.6"
+  }
+}
